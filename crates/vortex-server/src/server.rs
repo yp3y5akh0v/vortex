@@ -128,7 +128,7 @@ impl ServerBuilder {
             let handle = std::thread::Builder::new()
                 .name(format!("vortex-w{}", core_id))
                 .spawn(move || {
-                    worker_main(core_id, &addr, port, backlog, sqpoll, &db_cfg, db_conns, db_resolved)
+                    worker_main(core_id, num_workers, &addr, port, backlog, sqpoll, &db_cfg, db_conns, db_resolved)
                 })?;
             handles.push(handle);
         }
@@ -165,7 +165,7 @@ const BODY_BUF_SIZE: usize = 32768;
 /// Reusable buffers for DB endpoint handlers (eliminates per-request allocations).
 struct WorkerBufs {
     worlds: Vec<(i32, i32)>,
-    updates: Vec<(i32, i32)>,
+    random_numbers: Vec<i32>,
     fortunes: Vec<(i32, String)>,
     ids: Vec<i32>,
     html: Vec<u8>,
@@ -175,7 +175,7 @@ impl WorkerBufs {
     fn new() -> Self {
         Self {
             worlds: Vec::with_capacity(500),
-            updates: Vec::with_capacity(500),
+            random_numbers: Vec::with_capacity(500),
             fortunes: Vec::with_capacity(16),
             ids: Vec::with_capacity(500),
             html: Vec::with_capacity(4096),
@@ -186,6 +186,7 @@ impl WorkerBufs {
 /// Main event loop for a single worker thread.
 fn worker_main(
     core_id: usize,
+    num_workers: usize,
     addr: &str,
     port: u16,
     backlog: i32,
@@ -204,6 +205,11 @@ fn worker_main(
     let mut ring = Ring::new(&config)?;
 
     let listener_fd = socket::create_listener(addr, port, backlog)?;
+
+    // Attach BPF to route connections by CPU (non-fatal on failure)
+    if let Err(_e) = socket::attach_reuseport_cbpf(listener_fd, num_workers) {
+        eprintln!("[vortex] Worker {} BPF attach failed (non-fatal)", core_id);
+    }
     let mut date = DateCache::new();
 
     // Try to connect to PostgreSQL (optional — may not be available)
@@ -493,23 +499,25 @@ fn handle_updates(
         return write_500(connections, fd_idx);
     }
 
-    // Build update parameters: (new_randomNumber, id)
-    bufs.updates.clear();
+    // Build sorted ids and new random numbers for batch update
+    bufs.ids.clear();
+    bufs.random_numbers.clear();
     for &(id, _old_rn) in &bufs.worlds {
-        let new_rn = vortex_db::random_world_id();
-        bufs.updates.push((new_rn, id));
+        bufs.ids.push(id);
+        bufs.random_numbers.push(vortex_db::random_world_id());
     }
+    bufs.ids.sort_unstable(); // sorted ids reduce lock contention in PostgreSQL
 
-    // Execute pipelined updates
+    // Execute single batch UPDATE via unnest()
     let conn = pool.get();
-    if conn.update_worlds(&bufs.updates).is_err() {
+    if conn.update_worlds_batch(&bufs.ids, &bufs.random_numbers).is_err() {
         return write_500(connections, fd_idx);
     }
 
     // Build result: (id, new_randomNumber)
     bufs.worlds.clear();
-    for &(new_rn, id) in &bufs.updates {
-        bufs.worlds.push((id, new_rn));
+    for i in 0..bufs.ids.len() {
+        bufs.worlds.push((bufs.ids[i], bufs.random_numbers[i]));
     }
 
     let body_len = vortex_json::write_worlds(body_buf, &bufs.worlds);

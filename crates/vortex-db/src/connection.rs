@@ -10,11 +10,14 @@ use std::time::Duration;
 
 /// PostgreSQL OID for int4.
 const OID_INT4: u32 = 23;
+/// PostgreSQL OID for int4[].
+const OID_INT4_ARRAY: u32 = 1007;
 
 /// Pre-defined prepared statement names.
 pub const STMT_WORLD: &str = "w";
 pub const STMT_FORTUNE: &str = "f";
 pub const STMT_UPDATE: &str = "u";
+pub const STMT_UPDATE_BATCH: &str = "ub";
 
 /// A single PostgreSQL connection with prepared statements and reusable buffers.
 pub struct PgConnection {
@@ -166,6 +169,12 @@ impl PgConnection {
             "UPDATE World SET randomNumber = $1 WHERE id = $2",
             &[OID_INT4, OID_INT4],
         )?;
+        wire::write_parse(
+            self.reader.get_mut(),
+            STMT_UPDATE_BATCH,
+            "UPDATE world SET randomNumber = w.r FROM (SELECT unnest($1::int[]) AS i, unnest($2::int[]) AS r) AS w WHERE world.id = w.i",
+            &[OID_INT4_ARRAY, OID_INT4_ARRAY],
+        )?;
         wire::write_sync(self.reader.get_mut())?;
         wire::drain_until_ready(&mut self.reader)?;
         Ok(())
@@ -217,6 +226,17 @@ impl PgConnection {
             wire::buf_bind_i32(&mut self.wbuf, STMT_UPDATE, &[random_number, id]);
             wire::buf_execute(&mut self.wbuf);
         }
+        wire::buf_sync(&mut self.wbuf);
+        self.reader.get_mut().write_all(&self.wbuf)?;
+        wire::drain_until_ready_buf(&mut self.reader, &mut self.rbuf)
+    }
+
+    /// Batch update N worlds using unnest() — single SQL statement.
+    #[inline]
+    pub fn update_worlds_batch(&mut self, ids: &[i32], random_numbers: &[i32]) -> io::Result<()> {
+        self.wbuf.clear();
+        wire::buf_bind_i32_arrays(&mut self.wbuf, STMT_UPDATE_BATCH, ids, random_numbers);
+        wire::buf_execute(&mut self.wbuf);
         wire::buf_sync(&mut self.wbuf);
         self.reader.get_mut().write_all(&self.wbuf)?;
         wire::drain_until_ready_buf(&mut self.reader, &mut self.rbuf)

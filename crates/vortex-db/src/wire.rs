@@ -125,6 +125,55 @@ pub fn buf_bind_no_params(buf: &mut Vec<u8>, stmt_name: &str, result_formats: &[
     }
 }
 
+/// Append a Bind message with two int4[] binary array params to a buffer.
+/// Used for batch UPDATE with unnest($1::int[], $2::int[]).
+#[inline]
+pub fn buf_bind_i32_arrays(buf: &mut Vec<u8>, stmt_name: &str, arr1: &[i32], arr2: &[i32]) {
+    // Each int4 array in binary: 20 header bytes + N * 8 (len + value per element)
+    let arr1_data_len = 20 + arr1.len() * 8;
+    let arr2_data_len = 20 + arr2.len() * 8;
+
+    let body_len = (4
+        + 1 + stmt_name.len() + 1  // portal(\0) + stmt_name + \0
+        + 2 + 2                      // 1 format code = binary
+        + 2                          // num params = 2
+        + 4 + arr1_data_len          // param1 length prefix + array data
+        + 4 + arr2_data_len          // param2 length prefix + array data
+        + 2) as i32;                 // 0 result format codes (UPDATE returns no rows)
+
+    buf.push(b'B');
+    buf.extend_from_slice(&body_len.to_be_bytes());
+    buf.push(0); // unnamed portal
+    buf.extend_from_slice(stmt_name.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(&1i16.to_be_bytes()); // 1 format code
+    buf.extend_from_slice(&1i16.to_be_bytes()); // binary
+    buf.extend_from_slice(&2i16.to_be_bytes()); // 2 params
+
+    // Param 1: int4[] array
+    write_i32_array(buf, arr1);
+    // Param 2: int4[] array
+    write_i32_array(buf, arr2);
+
+    buf.extend_from_slice(&0i16.to_be_bytes()); // 0 result format codes
+}
+
+/// Write a single int4[] in PostgreSQL binary array format.
+#[inline]
+fn write_i32_array(buf: &mut Vec<u8>, values: &[i32]) {
+    let data_len = (20 + values.len() * 8) as i32;
+    buf.extend_from_slice(&data_len.to_be_bytes());  // param length
+    buf.extend_from_slice(&1i32.to_be_bytes());       // ndim = 1
+    buf.extend_from_slice(&0i32.to_be_bytes());       // has_nulls = 0
+    buf.extend_from_slice(&23i32.to_be_bytes());      // element_oid = OID_INT4
+    buf.extend_from_slice(&(values.len() as i32).to_be_bytes()); // dim size
+    buf.extend_from_slice(&1i32.to_be_bytes());       // dim lower bound = 1
+    for &val in values {
+        buf.extend_from_slice(&4i32.to_be_bytes());   // element length = 4
+        buf.extend_from_slice(&val.to_be_bytes());     // element value
+    }
+}
+
 /// Append an Execute message to a buffer.
 #[inline]
 pub fn buf_execute(buf: &mut Vec<u8>) {

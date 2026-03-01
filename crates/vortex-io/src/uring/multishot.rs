@@ -48,6 +48,24 @@ pub fn prep_recv(
         .user_data(user_data)
 }
 
+/// Prepare a single-shot recv SQE using provided buffer group.
+///
+/// The kernel selects a buffer from the ring. On completion, extract
+/// the buffer ID via `buffer_id(cqe.flags())`.
+#[inline]
+pub fn prep_recv_buf_select(
+    conn_fd: RawFd,
+    buf_size: u32,
+    buf_group_id: u16,
+    user_data: u64,
+) -> io_uring::squeue::Entry {
+    opcode::Recv::new(Fd(conn_fd), std::ptr::null_mut(), buf_size)
+        .buf_group(buf_group_id)
+        .build()
+        .flags(io_uring::squeue::Flags::BUFFER_SELECT)
+        .user_data(user_data)
+}
+
 /// Prepare a send SQE.
 #[inline]
 pub fn prep_send(
