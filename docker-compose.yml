@@ -1,0 +1,147 @@
+services:
+  # PostgreSQL database (TechEmpower standard)
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: benchmarkdbuser
+      POSTGRES_PASSWORD: benchmarkdbpass
+      POSTGRES_DB: hello_world
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - ./bench/db/create.sql:/docker-entrypoint-initdb.d/create.sql
+    ports:
+      - "5432:5432"
+    # Tuned for benchmarks
+    command: >
+      postgres
+      -c max_connections=512
+      -c shared_buffers=256MB
+      -c work_mem=64MB
+      -c effective_cache_size=512MB
+      -c synchronous_commit=off
+      -c full_page_writes=off
+      -c fsync=off
+      -c password_encryption=md5
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U benchmarkdbuser -d hello_world"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # Build and run the Vortex server
+  vortex:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    privileged: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - VORTEX_WORKERS=${VORTEX_WORKERS:-0}
+      - VORTEX_SQPOLL=${VORTEX_SQPOLL:-0}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=benchmarkdbuser
+      - DB_PASS=benchmarkdbpass
+      - DB_NAME=hello_world
+      - DB_POOL_SIZE=${DB_POOL_SIZE:-7}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # Benchmark: plaintext (standard)
+  bench:
+    image: skandyla/wrk
+    depends_on:
+      - vortex
+    profiles:
+      - bench
+    command: >
+      -t4 -c256 -d10s
+      http://vortex:8080/plaintext
+
+  # Benchmark: JSON (standard)
+  bench-json:
+    image: skandyla/wrk
+    depends_on:
+      - vortex
+    profiles:
+      - bench
+    command: >
+      -t4 -c256 -d10s
+      http://vortex:8080/json
+
+  # Benchmark: plaintext with pipelining (matches TechEmpower methodology)
+  bench-pipeline:
+    image: skandyla/wrk
+    depends_on:
+      - vortex
+    profiles:
+      - bench
+    volumes:
+      - ./bench:/bench
+    command: >
+      -t4 -c256 -d10s
+      -s /bench/pipeline.lua
+      http://vortex:8080/plaintext
+      -- 16
+
+  # Benchmark: JSON with pipelining
+  bench-pipeline-json:
+    image: skandyla/wrk
+    depends_on:
+      - vortex
+    profiles:
+      - bench
+    volumes:
+      - ./bench:/bench
+    command: >
+      -t4 -c256 -d10s
+      -s /bench/pipeline.lua
+      http://vortex:8080/json
+      -- 16
+
+  # Benchmark: /db (single query)
+  bench-db:
+    image: skandyla/wrk
+    depends_on:
+      - vortex
+    profiles:
+      - bench
+    command: >
+      -t4 -c256 -d10s
+      http://vortex:8080/db
+
+  # Benchmark: /fortunes
+  bench-fortunes:
+    image: skandyla/wrk
+    depends_on:
+      - vortex
+    profiles:
+      - bench
+    command: >
+      -t4 -c256 -d10s
+      http://vortex:8080/fortunes
+
+  # Development: build only
+  dev:
+    image: rust:1.82-slim-bookworm
+    volumes:
+      - .:/vortex
+      - cargo-cache:/usr/local/cargo/registry
+    working_dir: /vortex
+    profiles:
+      - dev
+    command: >
+      bash -c "apt-get update && apt-get install -y liburing-dev lld build-essential pkg-config
+      && cargo check --release"
+
+volumes:
+  cargo-cache:

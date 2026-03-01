@@ -1,0 +1,109 @@
+//! Socket creation and configuration.
+//!
+//! Applies all performance-critical socket options for maximum throughput.
+
+use std::io;
+use std::os::fd::RawFd;
+
+/// Create a non-blocking TCP listener socket with all performance options.
+pub fn create_listener(addr: &str, port: u16, backlog: i32) -> io::Result<RawFd> {
+    unsafe {
+        // Create socket
+        let fd = libc::socket(
+            libc::AF_INET,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        );
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SO_REUSEADDR — allow rebinding immediately
+        let val: libc::c_int = 1;
+        setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &val)?;
+
+        // SO_REUSEPORT — kernel distributes connections across per-core listeners
+        setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &val)?;
+
+        // TCP_NODELAY — disable Nagle's algorithm (send immediately)
+        setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &val)?;
+
+        // TCP_DEFER_ACCEPT — only wake on data, not just SYN-ACK
+        let defer_secs: libc::c_int = 1;
+        setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_DEFER_ACCEPT, &defer_secs)?;
+
+        // TCP_QUICKACK — disable delayed ACK
+        setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, &val)?;
+
+        // Bind
+        let ip = parse_ipv4(addr).unwrap_or(0); // 0.0.0.0
+        let sockaddr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as u16,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr { s_addr: ip },
+            sin_zero: [0; 8],
+        };
+        let ret = libc::bind(
+            fd,
+            &sockaddr as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        if ret < 0 {
+            libc::close(fd);
+            return Err(io::Error::last_os_error());
+        }
+
+        // Listen
+        let ret = libc::listen(fd, backlog);
+        if ret < 0 {
+            libc::close(fd);
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(fd)
+    }
+}
+
+/// Apply TCP_NODELAY to an accepted connection fd.
+#[inline]
+pub fn configure_accepted(fd: RawFd) -> io::Result<()> {
+    let val: libc::c_int = 1;
+    unsafe {
+        setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &val)?;
+        setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, &val)?;
+    }
+    Ok(())
+}
+
+/// Helper to call setsockopt with proper casting.
+#[inline]
+unsafe fn setsockopt<T>(fd: RawFd, level: libc::c_int, name: libc::c_int, val: &T) -> io::Result<()> {
+    let ret = libc::setsockopt(
+        fd,
+        level,
+        name,
+        val as *const T as *const libc::c_void,
+        std::mem::size_of::<T>() as libc::socklen_t,
+    );
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Parse an IPv4 address string to network-byte-order u32.
+fn parse_ipv4(addr: &str) -> Option<u32> {
+    if addr == "0.0.0.0" {
+        return Some(0);
+    }
+    let parts: Vec<&str> = addr.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let a = parts[0].parse::<u8>().ok()?;
+    let b = parts[1].parse::<u8>().ok()?;
+    let c = parts[2].parse::<u8>().ok()?;
+    let d = parts[3].parse::<u8>().ok()?;
+    Some(u32::from_ne_bytes([a, b, c, d]))
+}
