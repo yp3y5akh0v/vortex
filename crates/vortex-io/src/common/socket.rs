@@ -71,6 +71,11 @@ pub fn configure_accepted(fd: RawFd) -> io::Result<()> {
     unsafe {
         setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &val)?;
         setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, &val)?;
+
+        // SO_BUSY_POLL — spin 50μs for arriving data instead of interrupt-driven wake
+        const SO_BUSY_POLL: libc::c_int = 46;
+        let busy_poll: libc::c_int = 50;
+        let _ = setsockopt(fd, libc::SOL_SOCKET, SO_BUSY_POLL, &busy_poll);
     }
     Ok(())
 }

@@ -409,6 +409,96 @@ pub fn drain_until_ready_buf(reader: &mut impl Read, rbuf: &mut Vec<u8>) -> io::
     }
 }
 
+// ── Buffer-based parsing (async DB — works on byte slices) ──────────
+
+/// Scan a PG response buffer for the ReadyForQuery ('Z') message.
+/// Returns `Some(bytes_consumed)` when found, `None` if incomplete.
+#[inline]
+pub fn try_find_ready(buf: &[u8]) -> Option<usize> {
+    let mut pos = 0;
+    while pos + 5 <= buf.len() {
+        let msg_type = buf[pos];
+        let len = i32::from_be_bytes([buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4]]) as usize;
+        let msg_end = pos + 1 + len;
+        if msg_end > buf.len() {
+            return None; // incomplete message
+        }
+        if msg_type == b'Z' {
+            return Some(msg_end);
+        }
+        pos = msg_end;
+    }
+    None
+}
+
+/// Parse a single world row from a complete PG response buffer.
+#[inline]
+pub fn parse_single_world_buf(buf: &[u8]) -> Option<(i32, i32)> {
+    let mut pos = 0;
+    while pos + 5 <= buf.len() {
+        let msg_type = buf[pos];
+        let len = i32::from_be_bytes([buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4]]) as usize;
+        let msg_end = pos + 1 + len;
+        if msg_type == b'D' {
+            // Body: [num_cols(2)][col1_len(4)][col1(4)][col2_len(4)][col2(4)]
+            let b = pos + 5;
+            let id = i32::from_be_bytes([buf[b + 6], buf[b + 7], buf[b + 8], buf[b + 9]]);
+            let rn = i32::from_be_bytes([buf[b + 14], buf[b + 15], buf[b + 16], buf[b + 17]]);
+            return Some((id, rn));
+        }
+        if msg_type == b'Z' {
+            return None;
+        }
+        pos = msg_end;
+    }
+    None
+}
+
+/// Parse world rows from a complete PG response buffer. Appends to `out`.
+#[inline]
+pub fn parse_world_rows_buf(buf: &[u8], out: &mut Vec<(i32, i32)>) {
+    let mut pos = 0;
+    while pos + 5 <= buf.len() {
+        let msg_type = buf[pos];
+        let len = i32::from_be_bytes([buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4]]) as usize;
+        let msg_end = pos + 1 + len;
+        match msg_type {
+            b'D' => {
+                let b = pos + 5;
+                let id = i32::from_be_bytes([buf[b + 6], buf[b + 7], buf[b + 8], buf[b + 9]]);
+                let rn = i32::from_be_bytes([buf[b + 14], buf[b + 15], buf[b + 16], buf[b + 17]]);
+                out.push((id, rn));
+            }
+            b'Z' => return,
+            _ => {}
+        }
+        pos = msg_end;
+    }
+}
+
+/// Parse fortune rows from a complete PG response buffer. Appends to `out`.
+#[inline]
+pub fn parse_fortune_rows_buf(buf: &[u8], out: &mut Vec<(i32, String)>) {
+    let mut pos = 0;
+    while pos + 5 <= buf.len() {
+        let msg_type = buf[pos];
+        let len = i32::from_be_bytes([buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4]]) as usize;
+        let msg_end = pos + 1 + len;
+        match msg_type {
+            b'D' => {
+                let b = pos + 5;
+                let id = i32::from_be_bytes([buf[b + 6], buf[b + 7], buf[b + 8], buf[b + 9]]);
+                let text_len = i32::from_be_bytes([buf[b + 10], buf[b + 11], buf[b + 12], buf[b + 13]]) as usize;
+                let message = String::from_utf8_lossy(&buf[b + 14..b + 14 + text_len]).to_string();
+                out.push((id, message));
+            }
+            b'Z' => return,
+            _ => {}
+        }
+        pos = msg_end;
+    }
+}
+
 // ── Minimal MD5 implementation ───────────────────────────────────────
 
 fn md5_hash(a: &[u8], b: &[u8]) -> [u8; 16] {

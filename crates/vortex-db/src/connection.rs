@@ -6,6 +6,7 @@
 use crate::wire;
 use std::io::{self, BufReader, Write};
 use std::net::TcpStream;
+use std::os::fd::{IntoRawFd, RawFd};
 use std::time::Duration;
 
 /// PostgreSQL OID for int4.
@@ -99,6 +100,14 @@ impl PgConnection {
         }
 
         Err(last_err)
+    }
+
+    /// Consume this connection and return the raw socket fd.
+    ///
+    /// The fd is in blocking mode; the caller should set `O_NONBLOCK` if needed.
+    /// Prepared statements survive — they are server-side state, not tied to fd flags.
+    pub fn into_raw_fd(self) -> RawFd {
+        self.reader.into_inner().into_raw_fd()
     }
 
     /// Connect using hostname (resolves DNS each time — use connect_resolved for perf).

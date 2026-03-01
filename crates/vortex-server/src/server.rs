@@ -11,7 +11,8 @@ use vortex_http::date::DateCache;
 use vortex_http::parser::{self, Route};
 use vortex_http::pipeline;
 use vortex_http::response::{DynHtmlResponse, DynJsonResponse};
-use vortex_db::{DbConfig, PgPool};
+use vortex_db::{DbConfig, PgConnection};
+use std::collections::VecDeque;
 use std::io;
 
 /// Vortex HTTP server.
@@ -146,45 +147,61 @@ impl ServerBuilder {
     }
 }
 
-/// Token types encoded in io_uring user_data.
-/// Lower 32 bits encode the registered file slot index.
+// ── Token types encoded in io_uring user_data ───────────────────────
+// Lower 32 bits encode the slot/index.
+
 const TOKEN_ACCEPT: u64 = 0;
 const TOKEN_RECV_BASE: u64 = 1 << 32;
 const TOKEN_SEND_BASE: u64 = 2 << 32;
 const TOKEN_CLOSE_BASE: u64 = 3 << 32;
+const TOKEN_DB_SEND: u64 = 4 << 32;
+const TOKEN_DB_RECV: u64 = 5 << 32;
 
-/// Per-connection state (indexed by registered file slot).
+// ── Per-connection state ────────────────────────────────────────────
+
 struct Connection {
     send_buf: Vec<u8>,
 }
 
 const SEND_BUF_SIZE: usize = 65536;
-
-/// Scratch buffer for building JSON/HTML bodies before copying into send_buf.
 const BODY_BUF_SIZE: usize = 32768;
+const DB_BUF_SIZE: usize = 32768;
 
-/// Reusable buffers for DB endpoint handlers (eliminates per-request allocations).
-struct WorkerBufs {
+// ── Async DB types ──────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum DbOp {
+    Db,
+    Queries,
+    Fortunes,
+    UpdatesRead,
+    UpdatesWrite,
+}
+
+struct AsyncDbConn {
+    slot: u32,
+    wbuf: Vec<u8>,
+    rbuf: Vec<u8>,
+    rpos: usize,
+    idle: bool,
+    http_slot: u32,
+    op: DbOp,
+    queries: i32,
     worlds: Vec<(i32, i32)>,
+    ids: Vec<i32>,
     random_numbers: Vec<i32>,
     fortunes: Vec<(i32, String)>,
-    ids: Vec<i32>,
     html: Vec<u8>,
 }
 
-impl WorkerBufs {
-    fn new() -> Self {
-        Self {
-            worlds: Vec::with_capacity(500),
-            random_numbers: Vec::with_capacity(500),
-            fortunes: Vec::with_capacity(16),
-            ids: Vec::with_capacity(500),
-            html: Vec::with_capacity(4096),
-        }
-    }
+struct DbRequest {
+    http_slot: u32,
+    route: Route,
+    queries: i32,
 }
 
-/// Main event loop for a single worker thread.
+// ── Worker main ─────────────────────────────────────────────────────
+
 fn worker_main(
     core_id: usize,
     num_workers: usize,
@@ -205,15 +222,12 @@ fn worker_main(
     };
     let mut ring = Ring::new(&config)?;
 
-    // Register sparse file table for fixed file descriptors
-    // 4096 slots per worker: enough for max TFB concurrency (16384 conns / 32 cores)
     let file_table_cap = 4096u32;
     if let Err(e) = registered::register_files_sparse(&ring.submitter(), file_table_cap) {
         eprintln!("[vortex] Worker {} register_files_sparse failed: {} (falling back to Fd)", core_id, e);
     }
     let mut file_table = FileTable::new(file_table_cap);
 
-    // Provided buffer ring: kernel picks a buffer for each recv, no per-connection alloc
     let buf_ring = ProvidedBufRing::new(
         &ring.submitter(),
         0,
@@ -223,35 +237,69 @@ fn worker_main(
 
     let listener_fd = socket::create_listener(addr, port, backlog)?;
 
-    // Attach BPF to route connections by CPU (non-fatal on failure)
     if let Err(_e) = socket::attach_reuseport_cbpf(listener_fd, num_workers) {
         eprintln!("[vortex] Worker {} BPF attach failed (non-fatal)", core_id);
     }
     let mut date = DateCache::new();
 
-    // Try to connect to PostgreSQL (optional — may not be available)
-    let mut db_pool = if let Some(resolved) = db_addr {
+    // ── Async DB connections ────────────────────────────────────────
+    let mut db_conns: Vec<AsyncDbConn> = Vec::with_capacity(db_pool_size);
+    let mut db_queue: VecDeque<DbRequest> = VecDeque::with_capacity(256);
+
+    if let Some(resolved) = db_addr {
         std::thread::sleep(std::time::Duration::from_millis(core_id as u64 * 10));
-        match PgPool::new_resolved(resolved, db_config, db_pool_size) {
-            Ok(pool) => {
-                eprintln!("[vortex] Worker {} connected to DB ({} connections)", core_id, pool.len());
-                Some(pool)
-            }
-            Err(e) => {
-                eprintln!("[vortex] Worker {} DB connect failed: {} (DB endpoints disabled)", core_id, e);
-                None
+        for _ in 0..db_pool_size {
+            match PgConnection::connect_resolved(resolved, db_config) {
+                Ok(pg_conn) => {
+                    let raw_fd = pg_conn.into_raw_fd();
+                    unsafe {
+                        let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+                        libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    }
+                    let slot = match file_table.alloc() {
+                        Some(s) => s,
+                        None => { unsafe { libc::close(raw_fd); } break; }
+                    };
+                    if registered::update_file(&ring.submitter(), slot, raw_fd).is_err() {
+                        file_table.free(slot);
+                        unsafe { libc::close(raw_fd); }
+                        break;
+                    }
+                    unsafe { libc::close(raw_fd); }
+
+                    db_conns.push(AsyncDbConn {
+                        slot,
+                        wbuf: Vec::with_capacity(DB_BUF_SIZE),
+                        rbuf: vec![0u8; DB_BUF_SIZE],
+                        rpos: 0,
+                        idle: true,
+                        http_slot: 0,
+                        op: DbOp::Db,
+                        queries: 0,
+                        worlds: Vec::with_capacity(500),
+                        ids: Vec::with_capacity(500),
+                        random_numbers: Vec::with_capacity(500),
+                        fortunes: Vec::with_capacity(16),
+                        html: Vec::with_capacity(4096),
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[vortex] Worker {} DB connect failed: {}", core_id, e);
+                    break;
+                }
             }
         }
-    } else {
-        None
-    };
+        if !db_conns.is_empty() {
+            eprintln!("[vortex] Worker {} connected to DB ({} async connections)", core_id, db_conns.len());
+        } else {
+            eprintln!("[vortex] Worker {} DB not available (DB endpoints disabled)", core_id);
+        }
+    }
 
     let mut connections: Vec<Option<Connection>> = Vec::new();
     connections.resize_with(file_table_cap as usize, || None);
 
-    // Reusable scratch buffers
     let mut body_buf = vec![0u8; BODY_BUF_SIZE];
-    let mut bufs = WorkerBufs::new();
 
     unsafe {
         let sqe = multishot::prep_multishot_accept(listener_fd, TOKEN_ACCEPT);
@@ -275,20 +323,19 @@ fn worker_main(
         }
 
         for &(user_data, result, flags) in &cqes {
-            if user_data == TOKEN_ACCEPT {
-                if result >= 0 {
+            let token_type = user_data >> 32;
+
+            match token_type {
+                // ── Accept ──────────────────────────────────────────
+                0 => {
+                    if result < 0 { continue; }
                     let conn_fd = result;
                     let _ = socket::configure_accepted(conn_fd);
 
                     let slot = match file_table.alloc() {
                         Some(s) => s,
-                        None => {
-                            unsafe { libc::close(conn_fd); }
-                            continue;
-                        }
+                        None => { unsafe { libc::close(conn_fd); } continue; }
                     };
-
-                    // Register fd into slot, then close raw fd (kernel holds its own ref)
                     if registered::update_file(&ring.submitter(), slot, conn_fd).is_err() {
                         file_table.free(slot);
                         unsafe { libc::close(conn_fd); }
@@ -296,269 +343,391 @@ fn worker_main(
                     }
                     unsafe { libc::close(conn_fd); }
 
-                    let slot_idx = slot as usize;
-                    if slot_idx >= connections.len() {
-                        connections.resize_with(slot_idx + 1024, || None);
+                    let si = slot as usize;
+                    if si >= connections.len() {
+                        connections.resize_with(si + 1024, || None);
                     }
-
-                    connections[slot_idx] = Some(Connection {
+                    connections[si] = Some(Connection {
                         send_buf: vec![0u8; SEND_BUF_SIZE],
                     });
 
                     unsafe {
                         let sqe = multishot::prep_recv_buf_select_fixed(
-                            slot,
-                            buf_ring.buf_size(),
-                            buf_ring.bgid(),
+                            slot, buf_ring.buf_size(), buf_ring.bgid(),
                             TOKEN_RECV_BASE | slot as u64,
                         );
                         let _ = ring.push_sqe(&sqe);
                     }
                 }
-            } else if (user_data >> 32) == 1 {
-                // Recv completion
-                let slot = (user_data & 0xFFFFFFFF) as u32;
-                let slot_idx = slot as usize;
 
-                if result <= 0 {
-                    close_connection(&mut connections, slot_idx, slot, &mut ring)?;
-                } else {
+                // ── HTTP recv ───────────────────────────────────────
+                1 => {
+                    let slot = (user_data & 0xFFFFFFFF) as u32;
+                    let si = slot as usize;
+
+                    if result <= 0 {
+                        close_connection(&mut connections, si, slot, &mut ring)?;
+                        continue;
+                    }
+
                     let len = result as usize;
                     let buf_id = multishot::buffer_id(flags).unwrap();
                     let recv_data = buf_ring.get_buf(buf_id, len);
-
                     let route = parser::classify_fast(recv_data);
 
-                    let resp_len = match route {
+                    match route {
                         Route::Plaintext | Route::Json | Route::NotFound => {
-                            if let Some(conn) = &mut connections[slot_idx] {
+                            let resp_len = if let Some(conn) = &mut connections[si] {
                                 let (_count, rlen) = pipeline::process_pipelined(
-                                    recv_data,
-                                    &mut conn.send_buf,
-                                    &date,
+                                    recv_data, &mut conn.send_buf, &date,
                                 );
                                 rlen
+                            } else { 0 };
+                            buf_ring.return_buf(buf_id);
+
+                            if resp_len > 0 {
+                                if let Some(conn) = &connections[si] {
+                                    unsafe {
+                                        let sqe = multishot::prep_send_fixed(
+                                            slot, conn.send_buf.as_ptr(), resp_len as u32,
+                                            TOKEN_SEND_BASE | slot as u64,
+                                        );
+                                        let _ = ring.push_sqe(&sqe);
+                                    }
+                                }
                             } else {
-                                0
+                                close_connection(&mut connections, si, slot, &mut ring)?;
                             }
                         }
 
-                        Route::Db => {
+                        Route::Db | Route::Queries | Route::Fortunes | Route::Updates => {
+                            let queries = match route {
+                                Route::Queries | Route::Updates =>
+                                    vortex_db::clamp_queries(parser::parse_queries_param(recv_data)),
+                                _ => 1,
+                            };
                             buf_ring.return_buf(buf_id);
-                            handle_db(&mut connections, slot_idx, &date, &mut db_pool, &mut body_buf)
-                        }
-                        Route::Queries => {
-                            let queries = vortex_db::clamp_queries(parser::parse_queries_param(recv_data));
-                            buf_ring.return_buf(buf_id);
-                            handle_queries(&mut connections, slot_idx, &date, &mut db_pool, &mut body_buf, queries, &mut bufs)
-                        }
-                        Route::Fortunes => {
-                            buf_ring.return_buf(buf_id);
-                            handle_fortunes(&mut connections, slot_idx, &date, &mut db_pool, &mut bufs)
-                        }
-                        Route::Updates => {
-                            let queries = vortex_db::clamp_queries(parser::parse_queries_param(recv_data));
-                            buf_ring.return_buf(buf_id);
-                            handle_updates(&mut connections, slot_idx, &date, &mut db_pool, &mut body_buf, queries, &mut bufs)
-                        }
-                    };
 
-                    // Return buffer for pipeline routes (DB routes returned early above)
-                    if matches!(route, Route::Plaintext | Route::Json | Route::NotFound) {
-                        buf_ring.return_buf(buf_id);
-                    }
+                            if db_conns.is_empty() {
+                                let resp_len = write_503(&mut connections, si);
+                                if resp_len > 0 {
+                                    submit_http_send(slot, &connections, si, resp_len, &mut ring);
+                                }
+                                continue;
+                            }
 
-                    if resp_len > 0 {
-                        if let Some(conn) = &connections[slot_idx] {
-                            unsafe {
-                                let sqe = multishot::prep_send_fixed(
-                                    slot,
-                                    conn.send_buf.as_ptr(),
-                                    resp_len as u32,
-                                    TOKEN_SEND_BASE | slot as u64,
-                                );
-                                let _ = ring.push_sqe(&sqe);
+                            let db_idx = db_conns.iter().position(|c| c.idle);
+                            if let Some(db_idx) = db_idx {
+                                start_db_op(&mut db_conns[db_idx], db_idx, slot, route, queries, &mut ring);
+                            } else {
+                                db_queue.push_back(DbRequest { http_slot: slot, route, queries });
                             }
                         }
-                    } else {
-                        close_connection(&mut connections, slot_idx, slot, &mut ring)?;
                     }
                 }
-            } else if (user_data >> 32) == 2 {
-                // Send completion
-                let slot = (user_data & 0xFFFFFFFF) as u32;
-                let slot_idx = slot as usize;
 
-                if result < 0 {
-                    close_connection(&mut connections, slot_idx, slot, &mut ring)?;
-                } else if connections[slot_idx].is_some() {
+                // ── HTTP send complete ──────────────────────────────
+                2 => {
+                    let slot = (user_data & 0xFFFFFFFF) as u32;
+                    let si = slot as usize;
+
+                    if result < 0 {
+                        close_connection(&mut connections, si, slot, &mut ring)?;
+                    } else if connections[si].is_some() {
+                        unsafe {
+                            let sqe = multishot::prep_recv_buf_select_fixed(
+                                slot, buf_ring.buf_size(), buf_ring.bgid(),
+                                TOKEN_RECV_BASE | slot as u64,
+                            );
+                            let _ = ring.push_sqe(&sqe);
+                        }
+                    }
+                }
+
+                // ── Close complete ──────────────────────────────────
+                3 => {
+                    let slot = (user_data & 0xFFFFFFFF) as u32;
+                    file_table.free(slot);
+                }
+
+                // ── DB send complete ────────────────────────────────
+                4 => {
+                    let db_idx = (user_data & 0xFFFFFFFF) as usize;
+                    let db = &mut db_conns[db_idx];
+
+                    if result < 0 {
+                        let hs = db.http_slot;
+                        db.idle = true;
+                        let resp_len = write_500(&mut connections, hs as usize);
+                        if resp_len > 0 { submit_http_send(hs, &connections, hs as usize, resp_len, &mut ring); }
+                        drain_db_queue(&mut db_queue, &mut db_conns, &connections, &mut ring);
+                        continue;
+                    }
+
+                    // Submit recv on DB socket
                     unsafe {
-                        let sqe = multishot::prep_recv_buf_select_fixed(
-                            slot,
-                            buf_ring.buf_size(),
-                            buf_ring.bgid(),
-                            TOKEN_RECV_BASE | slot as u64,
+                        let sqe = multishot::prep_recv_fixed(
+                            db.slot,
+                            db.rbuf.as_mut_ptr().add(db.rpos),
+                            (db.rbuf.len() - db.rpos) as u32,
+                            TOKEN_DB_RECV | db_idx as u64,
                         );
                         let _ = ring.push_sqe(&sqe);
                     }
                 }
-            } else if (user_data >> 32) == 3 {
-                // Close completion — return slot to free pool
-                let slot = (user_data & 0xFFFFFFFF) as u32;
-                file_table.free(slot);
+
+                // ── DB recv complete ────────────────────────────────
+                5 => {
+                    let db_idx = (user_data & 0xFFFFFFFF) as usize;
+
+                    if result <= 0 {
+                        let db = &mut db_conns[db_idx];
+                        let hs = db.http_slot;
+                        db.idle = true;
+                        let resp_len = write_500(&mut connections, hs as usize);
+                        if resp_len > 0 { submit_http_send(hs, &connections, hs as usize, resp_len, &mut ring); }
+                        drain_db_queue(&mut db_queue, &mut db_conns, &connections, &mut ring);
+                        continue;
+                    }
+
+                    db_conns[db_idx].rpos += result as usize;
+
+                    // Check if complete PG response (ReadyForQuery found)
+                    let rpos = db_conns[db_idx].rpos;
+                    if vortex_db::wire::try_find_ready(&db_conns[db_idx].rbuf[..rpos]).is_none() {
+                        // Need more data
+                        let db = &mut db_conns[db_idx];
+                        unsafe {
+                            let sqe = multishot::prep_recv_fixed(
+                                db.slot,
+                                db.rbuf.as_mut_ptr().add(db.rpos),
+                                (db.rbuf.len() - db.rpos) as u32,
+                                TOKEN_DB_RECV | db_idx as u64,
+                            );
+                            let _ = ring.push_sqe(&sqe);
+                        }
+                        continue;
+                    }
+
+                    // ── Complete PG response — process by operation type ──
+                    let db = &mut db_conns[db_idx];
+                    let hs = db.http_slot;
+                    let hi = hs as usize;
+                    let op = db.op;
+
+                    match op {
+                        DbOp::Db => {
+                            let resp_len = match vortex_db::wire::parse_single_world_buf(&db.rbuf[..db.rpos]) {
+                                Some((id, rn)) => {
+                                    let body_len = vortex_json::write_world(&mut body_buf, id, rn);
+                                    if let Some(conn) = &mut connections[hi] {
+                                        DynJsonResponse::write(&mut conn.send_buf, &date, &body_buf[..body_len])
+                                    } else { 0 }
+                                }
+                                None => write_500(&mut connections, hi),
+                            };
+                            db.idle = true;
+                            if resp_len > 0 { submit_http_send(hs, &connections, hi, resp_len, &mut ring); }
+                        }
+
+                        DbOp::Queries => {
+                            db.worlds.clear();
+                            vortex_db::wire::parse_world_rows_buf(&db.rbuf[..db.rpos], &mut db.worlds);
+                            let body_len = vortex_json::write_worlds(&mut body_buf, &db.worlds);
+                            let resp_len = if let Some(conn) = &mut connections[hi] {
+                                DynJsonResponse::write(&mut conn.send_buf, &date, &body_buf[..body_len])
+                            } else { 0 };
+                            db.idle = true;
+                            if resp_len > 0 { submit_http_send(hs, &connections, hi, resp_len, &mut ring); }
+                        }
+
+                        DbOp::Fortunes => {
+                            db.fortunes.clear();
+                            vortex_db::wire::parse_fortune_rows_buf(&db.rbuf[..db.rpos], &mut db.fortunes);
+                            vortex_template::render_fortunes(&db.fortunes, &mut db.html);
+                            let resp_len = if let Some(conn) = &mut connections[hi] {
+                                DynHtmlResponse::write(&mut conn.send_buf, &date, &db.html)
+                            } else { 0 };
+                            db.idle = true;
+                            if resp_len > 0 { submit_http_send(hs, &connections, hi, resp_len, &mut ring); }
+                        }
+
+                        DbOp::UpdatesRead => {
+                            // Phase 1 done: parse world rows, prepare batch update
+                            db.worlds.clear();
+                            vortex_db::wire::parse_world_rows_buf(&db.rbuf[..db.rpos], &mut db.worlds);
+
+                            db.ids.clear();
+                            db.random_numbers.clear();
+                            for &(id, _) in &db.worlds {
+                                db.ids.push(id);
+                                db.random_numbers.push(vortex_db::random_world_id());
+                            }
+                            db.ids.sort_unstable();
+
+                            db.wbuf.clear();
+                            vortex_db::wire::buf_bind_i32_arrays(&mut db.wbuf, "ub", &db.ids, &db.random_numbers);
+                            vortex_db::wire::buf_execute(&mut db.wbuf);
+                            vortex_db::wire::buf_sync(&mut db.wbuf);
+
+                            db.op = DbOp::UpdatesWrite;
+                            db.rpos = 0;
+
+                            unsafe {
+                                let sqe = multishot::prep_send_fixed(
+                                    db.slot, db.wbuf.as_ptr(), db.wbuf.len() as u32,
+                                    TOKEN_DB_SEND | db_idx as u64,
+                                );
+                                let _ = ring.push_sqe(&sqe);
+                            }
+                            continue; // Skip drain — DB conn still busy
+                        }
+
+                        DbOp::UpdatesWrite => {
+                            // Phase 2 done: build JSON response
+                            db.worlds.clear();
+                            for i in 0..db.ids.len() {
+                                db.worlds.push((db.ids[i], db.random_numbers[i]));
+                            }
+                            let body_len = vortex_json::write_worlds(&mut body_buf, &db.worlds);
+                            let resp_len = if let Some(conn) = &mut connections[hi] {
+                                DynJsonResponse::write(&mut conn.send_buf, &date, &body_buf[..body_len])
+                            } else { 0 };
+                            db.idle = true;
+                            if resp_len > 0 { submit_http_send(hs, &connections, hi, resp_len, &mut ring); }
+                        }
+                    }
+
+                    // DB conn became idle — drain queued requests
+                    drain_db_queue(&mut db_queue, &mut db_conns, &connections, &mut ring);
+                }
+
+                _ => {}
             }
         }
     }
 }
 
-// ── DB endpoint handlers ─────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────
 
-/// Handle /db — single random world row.
-fn handle_db(
-    connections: &mut [Option<Connection>],
-    fd_idx: usize,
-    date: &DateCache,
-    db_pool: &mut Option<PgPool>,
-    body_buf: &mut [u8],
-) -> usize {
-    let pool = match db_pool.as_mut() {
-        Some(p) => p,
-        None => return write_503(connections, fd_idx),
-    };
-
-    let id = vortex_db::random_world_id();
-    let conn = pool.get();
-    match conn.query_world(id) {
-        Ok((world_id, random_number)) => {
-            let body_len = vortex_json::write_world(body_buf, world_id, random_number);
-            if let Some(http_conn) = &mut connections[fd_idx] {
-                DynJsonResponse::write(&mut http_conn.send_buf, date, &body_buf[..body_len])
-            } else {
-                0
-            }
+/// Submit an HTTP send SQE for a connection.
+#[inline]
+fn submit_http_send(
+    slot: u32,
+    connections: &[Option<Connection>],
+    si: usize,
+    resp_len: usize,
+    ring: &mut Ring,
+) {
+    if let Some(conn) = &connections[si] {
+        unsafe {
+            let sqe = multishot::prep_send_fixed(
+                slot, conn.send_buf.as_ptr(), resp_len as u32,
+                TOKEN_SEND_BASE | slot as u64,
+            );
+            let _ = ring.push_sqe(&sqe);
         }
-        Err(_) => write_500(connections, fd_idx),
     }
 }
 
-/// Handle /queries?queries=N — N random world rows.
-fn handle_queries(
-    connections: &mut [Option<Connection>],
-    fd_idx: usize,
-    date: &DateCache,
-    db_pool: &mut Option<PgPool>,
-    body_buf: &mut [u8],
+/// Build PG wire protocol messages and submit send to DB socket.
+fn start_db_op(
+    db: &mut AsyncDbConn,
+    db_idx: usize,
+    http_slot: u32,
+    route: Route,
     queries: i32,
-    bufs: &mut WorkerBufs,
-) -> usize {
-    let pool = match db_pool.as_mut() {
-        Some(p) => p,
-        None => return write_503(connections, fd_idx),
-    };
+    ring: &mut Ring,
+) {
+    db.idle = false;
+    db.http_slot = http_slot;
+    db.queries = queries;
+    db.rpos = 0;
+    db.wbuf.clear();
 
-    bufs.ids.clear();
-    for _ in 0..queries {
-        bufs.ids.push(vortex_db::random_world_id());
-    }
-
-    let conn = pool.get();
-    match conn.query_worlds(&bufs.ids, &mut bufs.worlds) {
-        Ok(()) => {
-            let body_len = vortex_json::write_worlds(body_buf, &bufs.worlds);
-            if let Some(http_conn) = &mut connections[fd_idx] {
-                DynJsonResponse::write(&mut http_conn.send_buf, date, &body_buf[..body_len])
-            } else {
-                0
-            }
+    match route {
+        Route::Db => {
+            db.op = DbOp::Db;
+            let id = vortex_db::random_world_id();
+            vortex_db::wire::buf_bind_i32(&mut db.wbuf, "w", &[id]);
+            vortex_db::wire::buf_execute(&mut db.wbuf);
+            vortex_db::wire::buf_sync(&mut db.wbuf);
         }
-        Err(_) => write_500(connections, fd_idx),
-    }
-}
-
-/// Handle /fortunes — HTML table of all fortunes.
-fn handle_fortunes(
-    connections: &mut [Option<Connection>],
-    fd_idx: usize,
-    date: &DateCache,
-    db_pool: &mut Option<PgPool>,
-    bufs: &mut WorkerBufs,
-) -> usize {
-    let pool = match db_pool.as_mut() {
-        Some(p) => p,
-        None => return write_503(connections, fd_idx),
-    };
-
-    let conn = pool.get();
-    match conn.query_fortunes(&mut bufs.fortunes) {
-        Ok(()) => {
-            vortex_template::render_fortunes(&bufs.fortunes, &mut bufs.html);
-            if let Some(http_conn) = &mut connections[fd_idx] {
-                DynHtmlResponse::write(&mut http_conn.send_buf, date, &bufs.html)
-            } else {
-                0
+        Route::Queries => {
+            db.op = DbOp::Queries;
+            db.ids.clear();
+            for _ in 0..queries {
+                db.ids.push(vortex_db::random_world_id());
             }
+            for i in 0..db.ids.len() {
+                let id = db.ids[i];
+                vortex_db::wire::buf_bind_i32(&mut db.wbuf, "w", &[id]);
+                vortex_db::wire::buf_execute(&mut db.wbuf);
+            }
+            vortex_db::wire::buf_sync(&mut db.wbuf);
         }
-        Err(_) => write_500(connections, fd_idx),
+        Route::Fortunes => {
+            db.op = DbOp::Fortunes;
+            vortex_db::wire::buf_bind_no_params(&mut db.wbuf, "f", &[1, 0]);
+            vortex_db::wire::buf_execute(&mut db.wbuf);
+            vortex_db::wire::buf_sync(&mut db.wbuf);
+        }
+        Route::Updates => {
+            db.op = DbOp::UpdatesRead;
+            db.ids.clear();
+            for _ in 0..queries {
+                db.ids.push(vortex_db::random_world_id());
+            }
+            for i in 0..db.ids.len() {
+                let id = db.ids[i];
+                vortex_db::wire::buf_bind_i32(&mut db.wbuf, "w", &[id]);
+                vortex_db::wire::buf_execute(&mut db.wbuf);
+            }
+            vortex_db::wire::buf_sync(&mut db.wbuf);
+        }
+        _ => {}
+    }
+
+    unsafe {
+        let sqe = multishot::prep_send_fixed(
+            db.slot, db.wbuf.as_ptr(), db.wbuf.len() as u32,
+            TOKEN_DB_SEND | db_idx as u64,
+        );
+        let _ = ring.push_sqe(&sqe);
     }
 }
 
-/// Handle /updates?queries=N — read N rows, update with new random values.
-fn handle_updates(
-    connections: &mut [Option<Connection>],
-    fd_idx: usize,
-    date: &DateCache,
-    db_pool: &mut Option<PgPool>,
-    body_buf: &mut [u8],
-    queries: i32,
-    bufs: &mut WorkerBufs,
-) -> usize {
-    let pool = match db_pool.as_mut() {
-        Some(p) => p,
-        None => return write_503(connections, fd_idx),
-    };
+/// Process queued DB requests when a connection becomes idle.
+fn drain_db_queue(
+    queue: &mut VecDeque<DbRequest>,
+    db_conns: &mut [AsyncDbConn],
+    connections: &[Option<Connection>],
+    ring: &mut Ring,
+) {
+    'drain: while !queue.is_empty() {
+        let idle_idx = match db_conns.iter().position(|c| c.idle) {
+            Some(idx) => idx,
+            None => break,
+        };
 
-    // Generate random IDs
-    bufs.ids.clear();
-    for _ in 0..queries {
-        bufs.ids.push(vortex_db::random_world_id());
-    }
+        let req = loop {
+            match queue.pop_front() {
+                Some(req) if connections[req.http_slot as usize].is_some() => break Some(req),
+                Some(_) => {} // HTTP connection gone, skip
+                None => break None,
+            }
+        };
 
-    // Read N random worlds
-    let conn = pool.get();
-    if conn.query_worlds(&bufs.ids, &mut bufs.worlds).is_err() {
-        return write_500(connections, fd_idx);
-    }
-
-    // Build sorted ids and new random numbers for batch update
-    bufs.ids.clear();
-    bufs.random_numbers.clear();
-    for &(id, _old_rn) in &bufs.worlds {
-        bufs.ids.push(id);
-        bufs.random_numbers.push(vortex_db::random_world_id());
-    }
-    bufs.ids.sort_unstable(); // sorted ids reduce lock contention in PostgreSQL
-
-    // Execute single batch UPDATE via unnest()
-    let conn = pool.get();
-    if conn.update_worlds_batch(&bufs.ids, &bufs.random_numbers).is_err() {
-        return write_500(connections, fd_idx);
-    }
-
-    // Build result: (id, new_randomNumber)
-    bufs.worlds.clear();
-    for i in 0..bufs.ids.len() {
-        bufs.worlds.push((bufs.ids[i], bufs.random_numbers[i]));
-    }
-
-    let body_len = vortex_json::write_worlds(body_buf, &bufs.worlds);
-    if let Some(http_conn) = &mut connections[fd_idx] {
-        DynJsonResponse::write(&mut http_conn.send_buf, date, &body_buf[..body_len])
-    } else {
-        0
+        match req {
+            Some(req) => {
+                start_db_op(&mut db_conns[idle_idx], idle_idx, req.http_slot, req.route, req.queries, ring);
+            }
+            None => break 'drain,
+        }
     }
 }
 
-// ── Error responses ──────────────────────────────────────────────────
+// ── Error responses ─────────────────────────────────────────────────
 
 fn write_500(connections: &mut [Option<Connection>], fd_idx: usize) -> usize {
     const RESP: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nServer: V\r\nContent-Length: 0\r\n\r\n";
@@ -592,7 +761,6 @@ fn close_connection(
                 let sqe = multishot::prep_close_fixed(slot, TOKEN_CLOSE_BASE | slot as u64);
                 let _ = ring.push_sqe(&sqe);
             }
-            // Slot is freed when the close CQE completes (TOKEN_CLOSE_BASE handler)
         }
     }
     Ok(())
