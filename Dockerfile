@@ -34,7 +34,8 @@ RUN mkdir -p crates/vortex-io/src && echo "" > crates/vortex-io/src/lib.rs && \
     mkdir -p crates/vortex-json/src && echo "" > crates/vortex-json/src/lib.rs && \
     mkdir -p crates/vortex-db/src && echo "" > crates/vortex-db/src/lib.rs && \
     mkdir -p crates/vortex-template/src && echo "" > crates/vortex-template/src/lib.rs && \
-    mkdir -p techempower/src && echo "fn main() {}" > techempower/src/main.rs
+    mkdir -p techempower/src && echo "fn main() {}" > techempower/src/main.rs && \
+    echo "fn main() {}" > techempower/src/profgen.rs
 
 # Pre-compile dependencies (cached layer)
 RUN cargo build --release 2>/dev/null || true

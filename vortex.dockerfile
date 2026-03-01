@@ -7,6 +7,9 @@ RUN apt-get update && apt-get install -y \
     lld \
     && rm -rf /var/lib/apt/lists/*
 
+# llvm-tools for PGO profile merging
+RUN rustup component add llvm-tools-preview
+
 WORKDIR /vortex
 
 # Copy manifests first for dependency caching
@@ -29,17 +32,31 @@ RUN mkdir -p crates/vortex-io/src && echo "" > crates/vortex-io/src/lib.rs && \
     mkdir -p crates/vortex-json/src && echo "" > crates/vortex-json/src/lib.rs && \
     mkdir -p crates/vortex-db/src && echo "" > crates/vortex-db/src/lib.rs && \
     mkdir -p crates/vortex-template/src && echo "" > crates/vortex-template/src/lib.rs && \
-    mkdir -p techempower/src && echo "fn main() {}" > techempower/src/main.rs
+    mkdir -p techempower/src && echo "fn main() {}" > techempower/src/main.rs && \
+    echo "fn main() {}" > techempower/src/profgen.rs
 
-# Pre-compile dependencies (cached layer)
-RUN cargo build --release 2>/dev/null || true
+# Pre-compile dependencies with PGO instrumentation flags (cached layer)
+RUN RUSTFLAGS="-Ctarget-cpu=native -Clink-arg=-fuse-ld=lld -Cprofile-generate=/tmp/pgo-data" \
+    cargo build --release 2>/dev/null || true
 
 # Copy actual source code
 COPY . .
 RUN find crates techempower -name "*.rs" -exec touch {} +
 
-# Build release binary
-RUN cargo build --release --bin vortex-bench
+# === PGO Phase 1: Build instrumented profiling binary ===
+RUN RUSTFLAGS="-Ctarget-cpu=native -Clink-arg=-fuse-ld=lld -Cprofile-generate=/tmp/pgo-data" \
+    cargo build --release --bin vortex-profgen
+
+# === PGO Phase 2: Run profiling harness to generate profile data ===
+RUN /vortex/target/release/vortex-profgen
+
+# === PGO Phase 3: Merge profile data ===
+RUN LLVM_PROFDATA="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata" && \
+    $LLVM_PROFDATA merge -o /tmp/pgo-merged.profdata /tmp/pgo-data/
+
+# === PGO Phase 4: Rebuild with profile-guided optimization ===
+RUN RUSTFLAGS="-Ctarget-cpu=native -Clink-arg=-fuse-ld=lld -Cprofile-use=/tmp/pgo-merged.profdata" \
+    cargo build --release --bin vortex-bench
 
 # Runtime image
 FROM debian:bookworm-slim

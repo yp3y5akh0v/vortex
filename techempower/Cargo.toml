@@ -10,6 +10,10 @@ description = "TechEmpower benchmark submission for Vortex"
 name = "vortex-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "vortex-profgen"
+path = "src/profgen.rs"
+
 [dependencies]
 vortex-server = { workspace = true }
 vortex-http = { workspace = true }
