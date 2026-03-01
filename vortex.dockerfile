@@ -1,10 +1,11 @@
 FROM rust:1.82-slim-bookworm AS builder
 
+# Install build deps + LLVM 16 for BOLT
 RUN apt-get update && apt-get install -y \
-    build-essential \
-    pkg-config \
-    liburing-dev \
-    lld \
+    build-essential pkg-config liburing-dev lld wget \
+    && wget -qO /etc/apt/trusted.gpg.d/llvm-snapshot.gpg https://apt.llvm.org/llvm-snapshot.gpg.key \
+    && echo "deb http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-16 main" > /etc/apt/sources.list.d/llvm-16.list \
+    && apt-get update && apt-get install -y bolt-16 \
     && rm -rf /var/lib/apt/lists/*
 
 # llvm-tools for PGO profile merging
@@ -54,19 +55,43 @@ RUN /vortex/target/release/vortex-profgen
 RUN LLVM_PROFDATA="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata" && \
     $LLVM_PROFDATA merge -o /tmp/pgo-merged.profdata /tmp/pgo-data/
 
-# === PGO Phase 4: Rebuild with profile-guided optimization ===
-RUN RUSTFLAGS="-Ctarget-cpu=native -Clink-arg=-fuse-ld=lld -Cprofile-use=/tmp/pgo-merged.profdata" \
-    cargo build --release --bin vortex-bench
+# === PGO Phase 4: Rebuild with PGO + emit-relocs (BOLT needs relocations) ===
+RUN RUSTFLAGS="-Ctarget-cpu=native -Clink-arg=-fuse-ld=lld -Clink-arg=-Wl,--emit-relocs -Cprofile-use=/tmp/pgo-merged.profdata" \
+    cargo build --release --bin vortex-bench --bin vortex-profgen
+
+# === BOLT Phase 5: Instrument profgen binary ===
+RUN llvm-bolt-16 /vortex/target/release/vortex-profgen \
+    -instrument \
+    -instrumentation-file=/tmp/bolt-prof \
+    -o /tmp/vortex-profgen-bolt
+
+# === BOLT Phase 6: Run instrumented profgen ===
+RUN /tmp/vortex-profgen-bolt
+
+# === BOLT Phase 7: Merge BOLT data and optimize server binary ===
+RUN merge-fdata-16 /tmp/bolt-prof*.fdata > /tmp/bolt-merged.fdata && \
+    llvm-bolt-16 /vortex/target/release/vortex-bench \
+    -data=/tmp/bolt-merged.fdata \
+    -match-profile-with-function-hash \
+    -reorder-blocks=ext-tsp \
+    -reorder-functions=cdsort \
+    -split-functions \
+    -split-all-cold \
+    -o /vortex/target/release/vortex-bench-bolted && \
+    strip /vortex/target/release/vortex-bench-bolted
 
 # Runtime image
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     liburing2 \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /vortex/target/release/vortex-bench /usr/local/bin/vortex
+COPY --from=builder /vortex/target/release/vortex-bench-bolted /usr/local/bin/vortex
+COPY run.sh /usr/local/bin/run.sh
+RUN chmod +x /usr/local/bin/run.sh
 
 EXPOSE 8080
 
-CMD ["vortex"]
+ENTRYPOINT ["/usr/local/bin/run.sh"]

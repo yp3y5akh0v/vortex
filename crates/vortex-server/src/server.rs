@@ -4,6 +4,7 @@ use vortex_io::common::affinity;
 use vortex_io::common::socket;
 use vortex_io::uring::multishot;
 use vortex_io::uring::registered;
+use vortex_io::uring::bufring::ProvidedBufRing;
 use vortex_io::uring::filetable::FileTable;
 use vortex_io::uring::ring::{Ring, RingConfig};
 use vortex_http::date::DateCache;
@@ -154,11 +155,9 @@ const TOKEN_CLOSE_BASE: u64 = 3 << 32;
 
 /// Per-connection state (indexed by registered file slot).
 struct Connection {
-    recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
 }
 
-const RECV_BUF_SIZE: usize = 4096;
 const SEND_BUF_SIZE: usize = 65536;
 
 /// Scratch buffer for building JSON/HTML bodies before copying into send_buf.
@@ -214,6 +213,14 @@ fn worker_main(
     }
     let mut file_table = FileTable::new(file_table_cap);
 
+    // Provided buffer ring: kernel picks a buffer for each recv, no per-connection alloc
+    let buf_ring = ProvidedBufRing::new(
+        &ring.submitter(),
+        0,
+        ProvidedBufRing::DEFAULT_BUF_COUNT,
+        ProvidedBufRing::DEFAULT_BUF_SIZE,
+    )?;
+
     let listener_fd = socket::create_listener(addr, port, backlog)?;
 
     // Attach BPF to route connections by CPU (non-fatal on failure)
@@ -256,7 +263,7 @@ fn worker_main(
 
     eprintln!("[vortex] Worker {} listening on fd {}", core_id, listener_fd);
 
-    let mut cqes: Vec<(u64, i32)> = Vec::with_capacity(256);
+    let mut cqes: Vec<(u64, i32, u32)> = Vec::with_capacity(256);
 
     loop {
         date.maybe_update();
@@ -264,10 +271,10 @@ fn worker_main(
 
         cqes.clear();
         for cqe in ring.completions() {
-            cqes.push((cqe.user_data(), cqe.result()));
+            cqes.push((cqe.user_data(), cqe.result(), cqe.flags()));
         }
 
-        for &(user_data, result) in &cqes {
+        for &(user_data, result, flags) in &cqes {
             if user_data == TOKEN_ACCEPT {
                 if result >= 0 {
                     let conn_fd = result;
@@ -295,20 +302,17 @@ fn worker_main(
                     }
 
                     connections[slot_idx] = Some(Connection {
-                        recv_buf: vec![0u8; RECV_BUF_SIZE],
                         send_buf: vec![0u8; SEND_BUF_SIZE],
                     });
 
-                    if let Some(conn) = &mut connections[slot_idx] {
-                        unsafe {
-                            let sqe = multishot::prep_recv_fixed(
-                                slot,
-                                conn.recv_buf.as_mut_ptr(),
-                                conn.recv_buf.len() as u32,
-                                TOKEN_RECV_BASE | slot as u64,
-                            );
-                            let _ = ring.push_sqe(&sqe);
-                        }
+                    unsafe {
+                        let sqe = multishot::prep_recv_buf_select_fixed(
+                            slot,
+                            buf_ring.buf_size(),
+                            buf_ring.bgid(),
+                            TOKEN_RECV_BASE | slot as u64,
+                        );
+                        let _ = ring.push_sqe(&sqe);
                     }
                 }
             } else if (user_data >> 32) == 1 {
@@ -320,18 +324,16 @@ fn worker_main(
                     close_connection(&mut connections, slot_idx, slot, &mut ring)?;
                 } else {
                     let len = result as usize;
+                    let buf_id = multishot::buffer_id(flags).unwrap();
+                    let recv_data = buf_ring.get_buf(buf_id, len);
 
-                    let route = if let Some(conn) = &connections[slot_idx] {
-                        parser::classify_fast(&conn.recv_buf[..len])
-                    } else {
-                        Route::NotFound
-                    };
+                    let route = parser::classify_fast(recv_data);
 
                     let resp_len = match route {
                         Route::Plaintext | Route::Json | Route::NotFound => {
                             if let Some(conn) = &mut connections[slot_idx] {
                                 let (_count, rlen) = pipeline::process_pipelined(
-                                    &conn.recv_buf[..len],
+                                    recv_data,
                                     &mut conn.send_buf,
                                     &date,
                                 );
@@ -342,28 +344,29 @@ fn worker_main(
                         }
 
                         Route::Db => {
+                            buf_ring.return_buf(buf_id);
                             handle_db(&mut connections, slot_idx, &date, &mut db_pool, &mut body_buf)
                         }
                         Route::Queries => {
-                            let queries = if let Some(conn) = &connections[slot_idx] {
-                                vortex_db::clamp_queries(parser::parse_queries_param(&conn.recv_buf[..len]))
-                            } else {
-                                1
-                            };
+                            let queries = vortex_db::clamp_queries(parser::parse_queries_param(recv_data));
+                            buf_ring.return_buf(buf_id);
                             handle_queries(&mut connections, slot_idx, &date, &mut db_pool, &mut body_buf, queries, &mut bufs)
                         }
                         Route::Fortunes => {
+                            buf_ring.return_buf(buf_id);
                             handle_fortunes(&mut connections, slot_idx, &date, &mut db_pool, &mut bufs)
                         }
                         Route::Updates => {
-                            let queries = if let Some(conn) = &connections[slot_idx] {
-                                vortex_db::clamp_queries(parser::parse_queries_param(&conn.recv_buf[..len]))
-                            } else {
-                                1
-                            };
+                            let queries = vortex_db::clamp_queries(parser::parse_queries_param(recv_data));
+                            buf_ring.return_buf(buf_id);
                             handle_updates(&mut connections, slot_idx, &date, &mut db_pool, &mut body_buf, queries, &mut bufs)
                         }
                     };
+
+                    // Return buffer for pipeline routes (DB routes returned early above)
+                    if matches!(route, Route::Plaintext | Route::Json | Route::NotFound) {
+                        buf_ring.return_buf(buf_id);
+                    }
 
                     if resp_len > 0 {
                         if let Some(conn) = &connections[slot_idx] {
@@ -388,17 +391,15 @@ fn worker_main(
 
                 if result < 0 {
                     close_connection(&mut connections, slot_idx, slot, &mut ring)?;
-                } else {
-                    if let Some(conn) = &mut connections[slot_idx] {
-                        unsafe {
-                            let sqe = multishot::prep_recv_fixed(
-                                slot,
-                                conn.recv_buf.as_mut_ptr(),
-                                conn.recv_buf.len() as u32,
-                                TOKEN_RECV_BASE | slot as u64,
-                            );
-                            let _ = ring.push_sqe(&sqe);
-                        }
+                } else if connections[slot_idx].is_some() {
+                    unsafe {
+                        let sqe = multishot::prep_recv_buf_select_fixed(
+                            slot,
+                            buf_ring.buf_size(),
+                            buf_ring.bgid(),
+                            TOKEN_RECV_BASE | slot as u64,
+                        );
+                        let _ = ring.push_sqe(&sqe);
                     }
                 }
             } else if (user_data >> 32) == 3 {

@@ -87,6 +87,21 @@ pub fn prep_close(fd: RawFd, user_data: u64) -> io_uring::squeue::Entry {
 
 // ── Registered file (Fixed) variants ─────────────────────────────────
 
+/// Prepare a single-shot recv SQE using a registered file slot + provided buffer group.
+#[inline]
+pub fn prep_recv_buf_select_fixed(
+    slot: u32,
+    buf_size: u32,
+    buf_group_id: u16,
+    user_data: u64,
+) -> io_uring::squeue::Entry {
+    opcode::Recv::new(Fixed(slot), std::ptr::null_mut(), buf_size)
+        .buf_group(buf_group_id)
+        .build()
+        .flags(io_uring::squeue::Flags::BUFFER_SELECT)
+        .user_data(user_data)
+}
+
 /// Prepare a recv SQE using a registered file slot.
 #[inline]
 pub fn prep_recv_fixed(

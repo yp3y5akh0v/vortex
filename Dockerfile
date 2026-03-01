@@ -48,6 +48,7 @@ RUN find crates techempower -name "*.rs" -exec touch {} +
 
 # Build release binary
 RUN cargo build --release --bin vortex-bench
+RUN strip /vortex/target/release/vortex-bench
 
 # Runtime image
 FROM debian:bookworm-slim AS runtime
