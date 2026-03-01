@@ -3,6 +3,8 @@
 use vortex_io::common::affinity;
 use vortex_io::common::socket;
 use vortex_io::uring::multishot;
+use vortex_io::uring::registered;
+use vortex_io::uring::filetable::FileTable;
 use vortex_io::uring::ring::{Ring, RingConfig};
 use vortex_http::date::DateCache;
 use vortex_http::parser::{self, Route};
@@ -144,14 +146,14 @@ impl ServerBuilder {
 }
 
 /// Token types encoded in io_uring user_data.
+/// Lower 32 bits encode the registered file slot index.
 const TOKEN_ACCEPT: u64 = 0;
 const TOKEN_RECV_BASE: u64 = 1 << 32;
 const TOKEN_SEND_BASE: u64 = 2 << 32;
-const TOKEN_CLOSE: u64 = u64::MAX;
+const TOKEN_CLOSE_BASE: u64 = 3 << 32;
 
-/// Per-connection state.
+/// Per-connection state (indexed by registered file slot).
 struct Connection {
-    fd: i32,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
 }
@@ -204,6 +206,14 @@ fn worker_main(
     };
     let mut ring = Ring::new(&config)?;
 
+    // Register sparse file table for fixed file descriptors
+    // 4096 slots per worker: enough for max TFB concurrency (16384 conns / 32 cores)
+    let file_table_cap = 4096u32;
+    if let Err(e) = registered::register_files_sparse(&ring.submitter(), file_table_cap) {
+        eprintln!("[vortex] Worker {} register_files_sparse failed: {} (falling back to Fd)", core_id, e);
+    }
+    let mut file_table = FileTable::new(file_table_cap);
+
     let listener_fd = socket::create_listener(addr, port, backlog)?;
 
     // Attach BPF to route connections by CPU (non-fatal on failure)
@@ -230,7 +240,7 @@ fn worker_main(
     };
 
     let mut connections: Vec<Option<Connection>> = Vec::new();
-    connections.resize_with(65536, || None);
+    connections.resize_with(file_table_cap as usize, || None);
 
     // Reusable scratch buffers
     let mut body_buf = vec![0u8; BODY_BUF_SIZE];
@@ -263,24 +273,39 @@ fn worker_main(
                     let conn_fd = result;
                     let _ = socket::configure_accepted(conn_fd);
 
-                    let fd_idx = conn_fd as usize;
-                    if fd_idx >= connections.len() {
-                        connections.resize_with(fd_idx + 1024, || None);
+                    let slot = match file_table.alloc() {
+                        Some(s) => s,
+                        None => {
+                            unsafe { libc::close(conn_fd); }
+                            continue;
+                        }
+                    };
+
+                    // Register fd into slot, then close raw fd (kernel holds its own ref)
+                    if registered::update_file(&ring.submitter(), slot, conn_fd).is_err() {
+                        file_table.free(slot);
+                        unsafe { libc::close(conn_fd); }
+                        continue;
+                    }
+                    unsafe { libc::close(conn_fd); }
+
+                    let slot_idx = slot as usize;
+                    if slot_idx >= connections.len() {
+                        connections.resize_with(slot_idx + 1024, || None);
                     }
 
-                    connections[fd_idx] = Some(Connection {
-                        fd: conn_fd,
+                    connections[slot_idx] = Some(Connection {
                         recv_buf: vec![0u8; RECV_BUF_SIZE],
                         send_buf: vec![0u8; SEND_BUF_SIZE],
                     });
 
-                    if let Some(conn) = &mut connections[fd_idx] {
+                    if let Some(conn) = &mut connections[slot_idx] {
                         unsafe {
-                            let sqe = multishot::prep_recv(
-                                conn_fd,
+                            let sqe = multishot::prep_recv_fixed(
+                                slot,
                                 conn.recv_buf.as_mut_ptr(),
                                 conn.recv_buf.len() as u32,
-                                TOKEN_RECV_BASE | conn_fd as u64,
+                                TOKEN_RECV_BASE | slot as u64,
                             );
                             let _ = ring.push_sqe(&sqe);
                         }
@@ -288,15 +313,15 @@ fn worker_main(
                 }
             } else if (user_data >> 32) == 1 {
                 // Recv completion
-                let conn_fd = (user_data & 0xFFFFFFFF) as i32;
-                let fd_idx = conn_fd as usize;
+                let slot = (user_data & 0xFFFFFFFF) as u32;
+                let slot_idx = slot as usize;
 
                 if result <= 0 {
-                    close_connection(&mut connections, fd_idx, &mut ring)?;
+                    close_connection(&mut connections, slot_idx, slot, &mut ring)?;
                 } else {
                     let len = result as usize;
 
-                    let route = if let Some(conn) = &connections[fd_idx] {
+                    let route = if let Some(conn) = &connections[slot_idx] {
                         parser::classify_fast(&conn.recv_buf[..len])
                     } else {
                         Route::NotFound
@@ -304,7 +329,7 @@ fn worker_main(
 
                     let resp_len = match route {
                         Route::Plaintext | Route::Json | Route::NotFound => {
-                            if let Some(conn) = &mut connections[fd_idx] {
+                            if let Some(conn) = &mut connections[slot_idx] {
                                 let (_count, rlen) = pipeline::process_pipelined(
                                     &conn.recv_buf[..len],
                                     &mut conn.send_buf,
@@ -317,65 +342,69 @@ fn worker_main(
                         }
 
                         Route::Db => {
-                            handle_db(&mut connections, fd_idx, &date, &mut db_pool, &mut body_buf)
+                            handle_db(&mut connections, slot_idx, &date, &mut db_pool, &mut body_buf)
                         }
                         Route::Queries => {
-                            let queries = if let Some(conn) = &connections[fd_idx] {
+                            let queries = if let Some(conn) = &connections[slot_idx] {
                                 vortex_db::clamp_queries(parser::parse_queries_param(&conn.recv_buf[..len]))
                             } else {
                                 1
                             };
-                            handle_queries(&mut connections, fd_idx, &date, &mut db_pool, &mut body_buf, queries, &mut bufs)
+                            handle_queries(&mut connections, slot_idx, &date, &mut db_pool, &mut body_buf, queries, &mut bufs)
                         }
                         Route::Fortunes => {
-                            handle_fortunes(&mut connections, fd_idx, &date, &mut db_pool, &mut bufs)
+                            handle_fortunes(&mut connections, slot_idx, &date, &mut db_pool, &mut bufs)
                         }
                         Route::Updates => {
-                            let queries = if let Some(conn) = &connections[fd_idx] {
+                            let queries = if let Some(conn) = &connections[slot_idx] {
                                 vortex_db::clamp_queries(parser::parse_queries_param(&conn.recv_buf[..len]))
                             } else {
                                 1
                             };
-                            handle_updates(&mut connections, fd_idx, &date, &mut db_pool, &mut body_buf, queries, &mut bufs)
+                            handle_updates(&mut connections, slot_idx, &date, &mut db_pool, &mut body_buf, queries, &mut bufs)
                         }
                     };
 
                     if resp_len > 0 {
-                        if let Some(conn) = &connections[fd_idx] {
+                        if let Some(conn) = &connections[slot_idx] {
                             unsafe {
-                                let sqe = multishot::prep_send(
-                                    conn_fd,
+                                let sqe = multishot::prep_send_fixed(
+                                    slot,
                                     conn.send_buf.as_ptr(),
                                     resp_len as u32,
-                                    TOKEN_SEND_BASE | conn_fd as u64,
+                                    TOKEN_SEND_BASE | slot as u64,
                                 );
                                 let _ = ring.push_sqe(&sqe);
                             }
                         }
                     } else {
-                        close_connection(&mut connections, fd_idx, &mut ring)?;
+                        close_connection(&mut connections, slot_idx, slot, &mut ring)?;
                     }
                 }
             } else if (user_data >> 32) == 2 {
                 // Send completion
-                let conn_fd = (user_data & 0xFFFFFFFF) as i32;
-                let fd_idx = conn_fd as usize;
+                let slot = (user_data & 0xFFFFFFFF) as u32;
+                let slot_idx = slot as usize;
 
                 if result < 0 {
-                    close_connection(&mut connections, fd_idx, &mut ring)?;
+                    close_connection(&mut connections, slot_idx, slot, &mut ring)?;
                 } else {
-                    if let Some(conn) = &mut connections[fd_idx] {
+                    if let Some(conn) = &mut connections[slot_idx] {
                         unsafe {
-                            let sqe = multishot::prep_recv(
-                                conn_fd,
+                            let sqe = multishot::prep_recv_fixed(
+                                slot,
                                 conn.recv_buf.as_mut_ptr(),
                                 conn.recv_buf.len() as u32,
-                                TOKEN_RECV_BASE | conn_fd as u64,
+                                TOKEN_RECV_BASE | slot as u64,
                             );
                             let _ = ring.push_sqe(&sqe);
                         }
                     }
                 }
+            } else if (user_data >> 32) == 3 {
+                // Close completion — return slot to free pool
+                let slot = (user_data & 0xFFFFFFFF) as u32;
+                file_table.free(slot);
             }
         }
     }
@@ -552,15 +581,17 @@ fn write_503(connections: &mut [Option<Connection>], fd_idx: usize) -> usize {
 
 fn close_connection(
     connections: &mut [Option<Connection>],
-    fd_idx: usize,
+    slot_idx: usize,
+    slot: u32,
     ring: &mut Ring,
 ) -> io::Result<()> {
-    if fd_idx < connections.len() {
-        if let Some(conn) = connections[fd_idx].take() {
+    if slot_idx < connections.len() {
+        if connections[slot_idx].take().is_some() {
             unsafe {
-                let sqe = multishot::prep_close(conn.fd, TOKEN_CLOSE);
+                let sqe = multishot::prep_close_fixed(slot, TOKEN_CLOSE_BASE | slot as u64);
                 let _ = ring.push_sqe(&sqe);
             }
+            // Slot is freed when the close CQE completes (TOKEN_CLOSE_BASE handler)
         }
     }
     Ok(())

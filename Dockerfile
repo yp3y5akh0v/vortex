@@ -54,10 +54,13 @@ FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y \
     liburing2 \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /vortex/target/release/vortex-bench /usr/local/bin/vortex
+COPY run.sh /usr/local/bin/run.sh
+RUN chmod +x /usr/local/bin/run.sh
 
 EXPOSE 8080
 
-CMD ["vortex"]
+ENTRYPOINT ["/usr/local/bin/run.sh"]

@@ -4,7 +4,7 @@
 //! eliminating the need to re-arm after each completion.
 
 use io_uring::opcode;
-use io_uring::types::Fd;
+use io_uring::types::{Fd, Fixed};
 use std::os::fd::RawFd;
 
 /// Prepare a multishot accept SQE.
@@ -83,6 +83,40 @@ pub fn prep_send(
 #[inline]
 pub fn prep_close(fd: RawFd, user_data: u64) -> io_uring::squeue::Entry {
     opcode::Close::new(Fd(fd)).build().user_data(user_data)
+}
+
+// ── Registered file (Fixed) variants ─────────────────────────────────
+
+/// Prepare a recv SQE using a registered file slot.
+#[inline]
+pub fn prep_recv_fixed(
+    slot: u32,
+    buf: *mut u8,
+    len: u32,
+    user_data: u64,
+) -> io_uring::squeue::Entry {
+    opcode::Recv::new(Fixed(slot), buf, len)
+        .build()
+        .user_data(user_data)
+}
+
+/// Prepare a send SQE using a registered file slot.
+#[inline]
+pub fn prep_send_fixed(
+    slot: u32,
+    buf: *const u8,
+    len: u32,
+    user_data: u64,
+) -> io_uring::squeue::Entry {
+    opcode::Send::new(Fixed(slot), buf, len)
+        .build()
+        .user_data(user_data)
+}
+
+/// Prepare a close SQE for a registered file slot.
+#[inline]
+pub fn prep_close_fixed(slot: u32, user_data: u64) -> io_uring::squeue::Entry {
+    opcode::Close::new(Fixed(slot)).build().user_data(user_data)
 }
 
 /// Check if a CQE has the MORE flag (multishot still active).
