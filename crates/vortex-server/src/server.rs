@@ -706,6 +706,8 @@ fn drain_db_queue(
 
 // ── Error responses ─────────────────────────────────────────────────
 
+#[cold]
+#[inline(never)]
 fn write_500(connections: &mut [Option<Connection>], fd_idx: usize) -> usize {
     const RESP: &[u8] = b"HTTP/1.1 500 Internal Server Error\r\nServer: V\r\nContent-Length: 0\r\n\r\n";
     if let Some(conn) = &mut connections[fd_idx] {
@@ -716,6 +718,8 @@ fn write_500(connections: &mut [Option<Connection>], fd_idx: usize) -> usize {
     }
 }
 
+#[cold]
+#[inline(never)]
 fn write_503(connections: &mut [Option<Connection>], fd_idx: usize) -> usize {
     const RESP: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nServer: V\r\nContent-Length: 0\r\n\r\n";
     if let Some(conn) = &mut connections[fd_idx] {

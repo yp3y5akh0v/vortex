@@ -8,6 +8,9 @@ use crate::parser::{self, Route};
 use crate::response::NotFoundResponse;
 use crate::date::DateCache;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+
 /// Process all pipelined requests in a buffer and write responses.
 ///
 /// Returns (requests_processed, response_bytes_written).
@@ -27,6 +30,8 @@ pub fn process_pipelined(
             send_buf[..resp_len].copy_from_slice(resp);
             let mut offset = resp_len;
             for _ in 1..count {
+                #[cfg(target_arch = "x86_64")]
+                unsafe { _mm_prefetch(send_buf.as_ptr().add(offset + resp_len) as *const i8, _MM_HINT_T0); }
                 send_buf[offset..offset + resp_len].copy_from_slice(resp);
                 offset += resp_len;
             }
@@ -40,6 +45,8 @@ pub fn process_pipelined(
             send_buf[..resp_len].copy_from_slice(resp);
             let mut offset = resp_len;
             for _ in 1..count {
+                #[cfg(target_arch = "x86_64")]
+                unsafe { _mm_prefetch(send_buf.as_ptr().add(offset + resp_len) as *const i8, _MM_HINT_T0); }
                 send_buf[offset..offset + resp_len].copy_from_slice(resp);
                 offset += resp_len;
             }
