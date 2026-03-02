@@ -79,6 +79,7 @@ fn main() {
 
         // Request boundary detection
         black_box(parser::find_request_end(plaintext_req));
+        black_box(parser::count_request_boundaries(&pipelined));
 
         // Pipelined response generation (primary plaintext hot path)
         black_box(pipeline::process_pipelined(

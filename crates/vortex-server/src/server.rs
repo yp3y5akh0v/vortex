@@ -174,7 +174,6 @@ enum DbOp {
     Db,
     Queries,
     Fortunes,
-    UpdatesRead,
     UpdatesWrite,
 }
 
@@ -300,6 +299,7 @@ fn worker_main(
     connections.resize_with(file_table_cap as usize, || None);
 
     let mut body_buf = vec![0u8; BODY_BUF_SIZE];
+    let mut send_buf_pool: Vec<Vec<u8>> = (0..256).map(|_| vec![0u8; SEND_BUF_SIZE]).collect();
 
     unsafe {
         let sqe = multishot::prep_multishot_accept(listener_fd, TOKEN_ACCEPT);
@@ -348,7 +348,7 @@ fn worker_main(
                         connections.resize_with(si + 1024, || None);
                     }
                     connections[si] = Some(Connection {
-                        send_buf: vec![0u8; SEND_BUF_SIZE],
+                        send_buf: send_buf_pool.pop().unwrap_or_else(|| vec![0u8; SEND_BUF_SIZE]),
                     });
 
                     unsafe {
@@ -366,7 +366,7 @@ fn worker_main(
                     let si = slot as usize;
 
                     if result <= 0 {
-                        close_connection(&mut connections, si, slot, &mut ring)?;
+                        close_connection(&mut connections, si, slot, &mut ring, &mut send_buf_pool)?;
                         continue;
                     }
 
@@ -396,7 +396,7 @@ fn worker_main(
                                     }
                                 }
                             } else {
-                                close_connection(&mut connections, si, slot, &mut ring)?;
+                                close_connection(&mut connections, si, slot, &mut ring, &mut send_buf_pool)?;
                             }
                         }
 
@@ -432,7 +432,7 @@ fn worker_main(
                     let si = slot as usize;
 
                     if result < 0 {
-                        close_connection(&mut connections, si, slot, &mut ring)?;
+                        close_connection(&mut connections, si, slot, &mut ring, &mut send_buf_pool)?;
                     } else if connections[si].is_some() {
                         unsafe {
                             let sqe = multishot::prep_recv_buf_select_fixed(
@@ -552,37 +552,6 @@ fn worker_main(
                             if resp_len > 0 { submit_http_send(hs, &connections, hi, resp_len, &mut ring); }
                         }
 
-                        DbOp::UpdatesRead => {
-                            // Phase 1 done: parse world rows, prepare batch update
-                            db.worlds.clear();
-                            vortex_db::wire::parse_world_rows_buf(&db.rbuf[..db.rpos], &mut db.worlds);
-
-                            db.ids.clear();
-                            db.random_numbers.clear();
-                            for &(id, _) in &db.worlds {
-                                db.ids.push(id);
-                                db.random_numbers.push(vortex_db::random_world_id());
-                            }
-                            db.ids.sort_unstable();
-
-                            db.wbuf.clear();
-                            vortex_db::wire::buf_bind_i32_arrays(&mut db.wbuf, "ub", &db.ids, &db.random_numbers);
-                            vortex_db::wire::buf_execute(&mut db.wbuf);
-                            vortex_db::wire::buf_sync(&mut db.wbuf);
-
-                            db.op = DbOp::UpdatesWrite;
-                            db.rpos = 0;
-
-                            unsafe {
-                                let sqe = multishot::prep_send_fixed(
-                                    db.slot, db.wbuf.as_ptr(), db.wbuf.len() as u32,
-                                    TOKEN_DB_SEND | db_idx as u64,
-                                );
-                                let _ = ring.push_sqe(&sqe);
-                            }
-                            continue; // Skip drain — DB conn still busy
-                        }
-
                         DbOp::UpdatesWrite => {
                             // Phase 2 done: build JSON response
                             db.worlds.clear();
@@ -673,16 +642,24 @@ fn start_db_op(
             vortex_db::wire::buf_sync(&mut db.wbuf);
         }
         Route::Updates => {
-            db.op = DbOp::UpdatesRead;
+            db.op = DbOp::UpdatesWrite;
             db.ids.clear();
+            db.random_numbers.clear();
             for _ in 0..queries {
                 db.ids.push(vortex_db::random_world_id());
             }
+            db.ids.sort_unstable();
+            for _ in 0..queries {
+                db.random_numbers.push(vortex_db::random_world_id());
+            }
+            // SELECTs + batch UPDATE in single pipeline (one round-trip)
             for i in 0..db.ids.len() {
                 let id = db.ids[i];
                 vortex_db::wire::buf_bind_i32(&mut db.wbuf, "w", &[id]);
                 vortex_db::wire::buf_execute(&mut db.wbuf);
             }
+            vortex_db::wire::buf_bind_i32_arrays(&mut db.wbuf, "ub", &db.ids, &db.random_numbers);
+            vortex_db::wire::buf_execute(&mut db.wbuf);
             vortex_db::wire::buf_sync(&mut db.wbuf);
         }
         _ => {}
@@ -754,9 +731,11 @@ fn close_connection(
     slot_idx: usize,
     slot: u32,
     ring: &mut Ring,
+    send_buf_pool: &mut Vec<Vec<u8>>,
 ) -> io::Result<()> {
     if slot_idx < connections.len() {
-        if connections[slot_idx].take().is_some() {
+        if let Some(conn) = connections[slot_idx].take() {
+            send_buf_pool.push(conn.send_buf);
             unsafe {
                 let sqe = multishot::prep_close_fixed(slot, TOKEN_CLOSE_BASE | slot as u64);
                 let _ = ring.push_sqe(&sqe);

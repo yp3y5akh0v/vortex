@@ -69,20 +69,43 @@ pub fn parse_request(buf: &[u8]) -> Result<(ParsedRequest<'_>, usize), ParseErro
 
 /// Find the end of an HTTP request in a buffer (the \r\n\r\n boundary).
 ///
-/// Returns the total length of the request including the terminator,
-/// or None if the request is incomplete.
+/// Uses u32 pattern matching — single compare per byte position.
 #[inline]
 pub fn find_request_end(buf: &[u8]) -> Option<usize> {
-    // Search for \r\n\r\n
     if buf.len() < 4 {
         return None;
     }
-    for i in 0..buf.len() - 3 {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
+    let target = u32::from_ne_bytes(*b"\r\n\r\n");
+    let ptr = buf.as_ptr();
+    for i in 0..=buf.len() - 4 {
+        let word = unsafe { (ptr.add(i) as *const u32).read_unaligned() };
+        if word == target {
             return Some(i + 4);
         }
     }
     None
+}
+
+/// Count the number of complete HTTP requests (\r\n\r\n boundaries) in a buffer.
+#[inline]
+pub fn count_request_boundaries(buf: &[u8]) -> usize {
+    if buf.len() < 4 {
+        return 0;
+    }
+    let target = u32::from_ne_bytes(*b"\r\n\r\n");
+    let ptr = buf.as_ptr();
+    let mut count = 0;
+    let mut i = 0;
+    while i <= buf.len() - 4 {
+        let word = unsafe { (ptr.add(i) as *const u32).read_unaligned() };
+        if word == target {
+            count += 1;
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    count
 }
 
 /// A parsed HTTP request (Tier 2).

@@ -15,12 +15,18 @@ pub mod pool;
 pub use connection::{DbConfig, PgConnection};
 pub use pool::PgPool;
 
+/// Thread-local RNG — seeded once per thread, not per call.
+use nanorand::{Rng, WyRand};
+use std::cell::RefCell;
+
+thread_local! {
+    static RNG: RefCell<WyRand> = RefCell::new(WyRand::new());
+}
+
 /// Generate a random World ID (1..=10000).
 #[inline]
 pub fn random_world_id() -> i32 {
-    use nanorand::Rng;
-    let mut rng = nanorand::WyRand::new();
-    (rng.generate_range(0_u32..10000) + 1) as i32
+    RNG.with(|rng| (rng.borrow_mut().generate_range(0_u32..10000) + 1) as i32)
 }
 
 /// Clamp a queries parameter to [1, 500].

@@ -9,30 +9,12 @@ use crate::date::DateCache;
 pub struct PlaintextResponse;
 
 impl PlaintextResponse {
-    const BODY: &'static [u8] = b"Hello, World!";
-    const HEADERS_PREFIX: &'static [u8] = b"HTTP/1.1 200 OK\r\nServer: V\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n";
-
-    /// Write the complete plaintext response into the buffer.
-    /// Returns the number of bytes written.
+    /// Write the complete plaintext response (single copy from DateCache).
     #[inline]
     pub fn write(buf: &mut [u8], date: &DateCache) -> usize {
-        let mut offset = 0;
-
-        let prefix = Self::HEADERS_PREFIX;
-        buf[offset..offset + prefix.len()].copy_from_slice(prefix);
-        offset += prefix.len();
-
-        let date_bytes = date.header_bytes();
-        buf[offset..offset + date_bytes.len()].copy_from_slice(date_bytes);
-        offset += date_bytes.len();
-
-        buf[offset..offset + 2].copy_from_slice(b"\r\n");
-        offset += 2;
-
-        buf[offset..offset + Self::BODY.len()].copy_from_slice(Self::BODY);
-        offset += Self::BODY.len();
-
-        offset
+        let resp = date.plaintext_response();
+        buf[..resp.len()].copy_from_slice(resp);
+        resp.len()
     }
 }
 
@@ -40,29 +22,12 @@ impl PlaintextResponse {
 pub struct JsonResponse;
 
 impl JsonResponse {
-    const BODY: &'static [u8] = b"{\"message\":\"Hello, World!\"}";
-    const HEADERS_PREFIX: &'static [u8] = b"HTTP/1.1 200 OK\r\nServer: V\r\nContent-Type: application/json\r\nContent-Length: 27\r\n";
-
-    /// Write the complete JSON response into the buffer.
+    /// Write the complete JSON response (single copy from DateCache).
     #[inline]
     pub fn write(buf: &mut [u8], date: &DateCache) -> usize {
-        let mut offset = 0;
-
-        let prefix = Self::HEADERS_PREFIX;
-        buf[offset..offset + prefix.len()].copy_from_slice(prefix);
-        offset += prefix.len();
-
-        let date_bytes = date.header_bytes();
-        buf[offset..offset + date_bytes.len()].copy_from_slice(date_bytes);
-        offset += date_bytes.len();
-
-        buf[offset..offset + 2].copy_from_slice(b"\r\n");
-        offset += 2;
-
-        buf[offset..offset + Self::BODY.len()].copy_from_slice(Self::BODY);
-        offset += Self::BODY.len();
-
-        offset
+        let resp = date.json_response();
+        buf[..resp.len()].copy_from_slice(resp);
+        resp.len()
     }
 }
 
