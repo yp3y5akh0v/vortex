@@ -16,13 +16,7 @@ use std::collections::VecDeque;
 use std::io;
 
 /// Vortex HTTP server.
-pub struct Server {
-    addr: String,
-    port: u16,
-    workers: usize,
-    backlog: i32,
-    sqpoll: bool,
-}
+pub struct Server;
 
 impl Server {
     /// Create a new server builder.
@@ -311,18 +305,22 @@ fn worker_main(
 
     eprintln!("[vortex] Worker {} listening on fd {}", core_id, listener_fd);
 
-    let mut cqes: Vec<(u64, i32, u32)> = Vec::with_capacity(256);
+    let mut cqes = [(0u64, 0i32, 0u32); 512];
 
     loop {
         date.maybe_update();
         ring.submit_and_wait(1)?;
 
-        cqes.clear();
+        let mut cqe_count = 0usize;
         for cqe in ring.completions() {
-            cqes.push((cqe.user_data(), cqe.result(), cqe.flags()));
+            if cqe_count < 512 {
+                cqes[cqe_count] = (cqe.user_data(), cqe.result(), cqe.flags());
+                cqe_count += 1;
+            }
         }
 
-        for &(user_data, result, flags) in &cqes {
+        for ci in 0..cqe_count {
+            let (user_data, result, flags) = cqes[ci];
             let token_type = user_data >> 32;
 
             match token_type {
