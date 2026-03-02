@@ -2,10 +2,12 @@ FROM rust:1.82-slim-bookworm AS builder
 
 # Install build deps + LLVM 16 for BOLT
 RUN apt-get update && apt-get install -y \
-    build-essential pkg-config liburing-dev lld wget \
-    && wget -qO /etc/apt/trusted.gpg.d/llvm-snapshot.gpg https://apt.llvm.org/llvm-snapshot.gpg.key \
+    build-essential pkg-config liburing-dev lld wget gnupg \
+    && wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/trusted.gpg.d/llvm-snapshot.gpg \
     && echo "deb http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-16 main" > /etc/apt/sources.list.d/llvm-16.list \
-    && apt-get update && apt-get install -y bolt-16 \
+    && apt-get update && apt-get install -y bolt-16 libbolt-16-dev \
+    && ln -s /usr/lib/llvm-16/lib/libbolt_rt_instr.a /usr/lib/libbolt_rt_instr.a \
+    && ln -s /usr/lib/llvm-16/lib/libbolt_rt_hugify.a /usr/lib/libbolt_rt_hugify.a \
     && rm -rf /var/lib/apt/lists/*
 
 # llvm-tools for PGO profile merging
@@ -65,20 +67,15 @@ RUN llvm-bolt-16 /vortex/target/release/vortex-profgen \
     -instrumentation-file=/tmp/bolt-prof \
     -o /tmp/vortex-profgen-bolt
 
-# === BOLT Phase 6: Run instrumented profgen ===
-RUN /tmp/vortex-profgen-bolt
-
-# === BOLT Phase 7: Merge BOLT data and optimize server binary ===
-RUN merge-fdata-16 /tmp/bolt-prof*.fdata > /tmp/bolt-merged.fdata && \
+# === BOLT Phase 6: Run instrumented profgen + optimize server binary ===
+RUN /tmp/vortex-profgen-bolt && \
     llvm-bolt-16 /vortex/target/release/vortex-bench \
-    -data=/tmp/bolt-merged.fdata \
-    -match-profile-with-function-hash \
+    -data=/tmp/bolt-prof \
     -reorder-blocks=ext-tsp \
-    -reorder-functions=cdsort \
+    -reorder-functions=hfsort+ \
     -split-functions \
     -split-all-cold \
-    -o /vortex/target/release/vortex-bench-bolted && \
-    strip /vortex/target/release/vortex-bench-bolted
+    -o /vortex/target/release/vortex-bench-bolted
 
 # Runtime image
 FROM debian:bookworm-slim
