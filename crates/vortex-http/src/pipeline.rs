@@ -5,11 +5,8 @@
 //! Slow path: per-request classify + response for mixed routes.
 
 use crate::parser::{self, Route};
-use crate::response::NotFoundResponse;
+use crate::response::{NotFoundResponse, PlaintextResponse, JsonResponse};
 use crate::date::DateCache;
-
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 
 /// Process all pipelined requests in a buffer and write responses.
 ///
@@ -25,14 +22,10 @@ pub fn process_pipelined(
         Route::Plaintext => {
             let count = parser::count_request_boundaries(recv_buf);
             if count == 0 { return (0, 0); }
-            let resp = date.plaintext_response();
-            let resp_len = resp.len();
-            send_buf[..resp_len].copy_from_slice(resp);
+            let resp_len = PlaintextResponse::write(send_buf, date);
             let mut offset = resp_len;
             for _ in 1..count {
-                #[cfg(target_arch = "x86_64")]
-                unsafe { _mm_prefetch(send_buf.as_ptr().add(offset + resp_len) as *const i8, _MM_HINT_T0); }
-                send_buf[offset..offset + resp_len].copy_from_slice(resp);
+                send_buf.copy_within(0..resp_len, offset);
                 offset += resp_len;
             }
             (count, offset)
@@ -40,14 +33,10 @@ pub fn process_pipelined(
         Route::Json => {
             let count = parser::count_request_boundaries(recv_buf);
             if count == 0 { return (0, 0); }
-            let resp = date.json_response();
-            let resp_len = resp.len();
-            send_buf[..resp_len].copy_from_slice(resp);
+            let resp_len = JsonResponse::write(send_buf, date);
             let mut offset = resp_len;
             for _ in 1..count {
-                #[cfg(target_arch = "x86_64")]
-                unsafe { _mm_prefetch(send_buf.as_ptr().add(offset + resp_len) as *const i8, _MM_HINT_T0); }
-                send_buf[offset..offset + resp_len].copy_from_slice(resp);
+                send_buf.copy_within(0..resp_len, offset);
                 offset += resp_len;
             }
             (count, offset)
@@ -75,16 +64,8 @@ fn process_pipelined_slow(
 
         let route = parser::classify_fast(remaining);
         let written = match route {
-            Route::Plaintext => {
-                let resp = date.plaintext_response();
-                send_buf[send_offset..send_offset + resp.len()].copy_from_slice(resp);
-                resp.len()
-            }
-            Route::Json => {
-                let resp = date.json_response();
-                send_buf[send_offset..send_offset + resp.len()].copy_from_slice(resp);
-                resp.len()
-            }
+            Route::Plaintext => PlaintextResponse::write(&mut send_buf[send_offset..], date),
+            Route::Json => JsonResponse::write(&mut send_buf[send_offset..], date),
             _ => NotFoundResponse::write(&mut send_buf[send_offset..]),
         };
 

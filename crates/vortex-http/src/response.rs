@@ -1,33 +1,55 @@
-//! Pre-built HTTP response templates.
+//! HTTP response assembly.
 //!
-//! For benchmark endpoints, the entire response (minus Date header)
-//! is a compile-time constant. This eliminates all response generation cost.
+//! Each response is assembled per-request from static header constants,
+//! the cached Date header, and the body.
 
 use crate::date::DateCache;
 
-/// Pre-built plaintext response components.
+/// Plaintext response.
 pub struct PlaintextResponse;
 
 impl PlaintextResponse {
-    /// Write the complete plaintext response (single copy from DateCache).
+    const HEADER: &'static [u8] = b"HTTP/1.1 200 OK\r\nServer: V\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n";
+    const BODY: &'static [u8] = b"Hello, World!";
+
+    /// Assemble the complete plaintext response per-request.
     #[inline]
     pub fn write(buf: &mut [u8], date: &DateCache) -> usize {
-        let resp = date.plaintext_response();
-        buf[..resp.len()].copy_from_slice(resp);
-        resp.len()
+        let mut off = 0;
+        buf[off..off + Self::HEADER.len()].copy_from_slice(Self::HEADER);
+        off += Self::HEADER.len();
+        let date_bytes = date.header_bytes();
+        buf[off..off + date_bytes.len()].copy_from_slice(date_bytes);
+        off += date_bytes.len();
+        buf[off..off + 2].copy_from_slice(b"\r\n");
+        off += 2;
+        buf[off..off + Self::BODY.len()].copy_from_slice(Self::BODY);
+        off += Self::BODY.len();
+        off
     }
 }
 
-/// Pre-built JSON response components.
+/// JSON response.
 pub struct JsonResponse;
 
 impl JsonResponse {
-    /// Write the complete JSON response (single copy from DateCache).
+    const HEADER: &'static [u8] = b"HTTP/1.1 200 OK\r\nServer: V\r\nContent-Type: application/json\r\nContent-Length: 27\r\n";
+    const BODY: &'static [u8] = b"{\"message\":\"Hello, World!\"}";
+
+    /// Assemble the complete JSON response per-request.
     #[inline]
     pub fn write(buf: &mut [u8], date: &DateCache) -> usize {
-        let resp = date.json_response();
-        buf[..resp.len()].copy_from_slice(resp);
-        resp.len()
+        let mut off = 0;
+        buf[off..off + Self::HEADER.len()].copy_from_slice(Self::HEADER);
+        off += Self::HEADER.len();
+        let date_bytes = date.header_bytes();
+        buf[off..off + date_bytes.len()].copy_from_slice(date_bytes);
+        off += date_bytes.len();
+        buf[off..off + 2].copy_from_slice(b"\r\n");
+        off += 2;
+        buf[off..off + Self::BODY.len()].copy_from_slice(Self::BODY);
+        off += Self::BODY.len();
+        off
     }
 }
 

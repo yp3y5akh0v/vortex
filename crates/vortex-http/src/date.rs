@@ -12,12 +12,6 @@ pub struct DateCache {
     buf: [u8; 37],
     /// Unix timestamp of last update.
     last_update: i64,
-    /// Pre-built complete plaintext response (rebuilt once/sec).
-    plaintext_response: [u8; 128],
-    plaintext_len: usize,
-    /// Pre-built complete JSON response (rebuilt once/sec).
-    json_response: [u8; 160],
-    json_len: usize,
 }
 
 impl DateCache {
@@ -28,10 +22,6 @@ impl DateCache {
         let mut cache = Self {
             buf: [0u8; 37],
             last_update: 0,
-            plaintext_response: [0u8; 128],
-            plaintext_len: 0,
-            json_response: [0u8; 160],
-            json_len: 0,
         };
         cache.update();
         cache
@@ -101,55 +91,12 @@ impl DateCache {
             b[31] = b' '; b[32] = b'G'; b[33] = b'M'; b[34] = b'T';
             b[35] = b'\r'; b[36] = b'\n';
         }
-
-        // Rebuild pre-built plaintext response
-        {
-            let mut off = 0;
-            let prefix = b"HTTP/1.1 200 OK\r\nServer: V\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n";
-            self.plaintext_response[off..off + prefix.len()].copy_from_slice(prefix);
-            off += prefix.len();
-            self.plaintext_response[off..off + 37].copy_from_slice(&self.buf);
-            off += 37;
-            self.plaintext_response[off..off + 2].copy_from_slice(b"\r\n");
-            off += 2;
-            self.plaintext_response[off..off + 13].copy_from_slice(b"Hello, World!");
-            off += 13;
-            self.plaintext_len = off;
-        }
-
-        // Rebuild pre-built JSON response
-        {
-            let mut off = 0;
-            let prefix = b"HTTP/1.1 200 OK\r\nServer: V\r\nContent-Type: application/json\r\nContent-Length: 27\r\n";
-            self.json_response[off..off + prefix.len()].copy_from_slice(prefix);
-            off += prefix.len();
-            self.json_response[off..off + 37].copy_from_slice(&self.buf);
-            off += 37;
-            self.json_response[off..off + 2].copy_from_slice(b"\r\n");
-            off += 2;
-            let body = b"{\"message\":\"Hello, World!\"}";
-            self.json_response[off..off + body.len()].copy_from_slice(body);
-            off += body.len();
-            self.json_len = off;
-        }
     }
 
     /// Get the complete Date header bytes.
     #[inline(always)]
     pub fn header_bytes(&self) -> &[u8] {
         &self.buf[..Self::HEADER_LEN]
-    }
-
-    /// Get the pre-built complete plaintext response.
-    #[inline(always)]
-    pub fn plaintext_response(&self) -> &[u8] {
-        &self.plaintext_response[..self.plaintext_len]
-    }
-
-    /// Get the pre-built complete JSON response.
-    #[inline(always)]
-    pub fn json_response(&self) -> &[u8] {
-        &self.json_response[..self.json_len]
     }
 }
 
