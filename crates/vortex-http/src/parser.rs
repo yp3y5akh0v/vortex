@@ -2,6 +2,10 @@
 //!
 //! Tier 1: Ultra-fast path classification (~3ns) - for benchmark routes
 //! Tier 2: httparse with SIMD for general HTTP/1.1 requests
+//! SSE2 SIMD for \r\n\r\n boundary scanning (16 bytes per iteration)
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 /// Known routes for fast-path matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,43 +73,97 @@ pub fn parse_request(buf: &[u8]) -> Result<(ParsedRequest<'_>, usize), ParseErro
 
 /// Find the end of an HTTP request in a buffer (the \r\n\r\n boundary).
 ///
-/// Uses u32 pattern matching — single compare per byte position.
+/// SSE2: scans 16 byte positions per iteration using parallel comparison.
 #[inline]
 pub fn find_request_end(buf: &[u8]) -> Option<usize> {
     if buf.len() < 4 {
         return None;
     }
-    let target = u32::from_ne_bytes(*b"\r\n\r\n");
-    let ptr = buf.as_ptr();
-    for i in 0..=buf.len() - 4 {
-        let word = unsafe { (ptr.add(i) as *const u32).read_unaligned() };
-        if word == target {
-            return Some(i + 4);
+
+    unsafe {
+        let ptr = buf.as_ptr();
+        let len = buf.len();
+        let cr = _mm_set1_epi8(b'\r' as i8);
+        let lf = _mm_set1_epi8(b'\n' as i8);
+        let mut i = 0;
+
+        // SSE2: check 16 positions per iteration
+        while i + 19 <= len {
+            let v0 = _mm_loadu_si128(ptr.add(i) as *const __m128i);
+            let v1 = _mm_loadu_si128(ptr.add(i + 1) as *const __m128i);
+            let v2 = _mm_loadu_si128(ptr.add(i + 2) as *const __m128i);
+            let v3 = _mm_loadu_si128(ptr.add(i + 3) as *const __m128i);
+
+            let m = _mm_and_si128(
+                _mm_and_si128(_mm_cmpeq_epi8(v0, cr), _mm_cmpeq_epi8(v1, lf)),
+                _mm_and_si128(_mm_cmpeq_epi8(v2, cr), _mm_cmpeq_epi8(v3, lf)),
+            );
+            let mask = _mm_movemask_epi8(m) as u32;
+            if mask != 0 {
+                return Some(i + mask.trailing_zeros() as usize + 4);
+            }
+            i += 16;
         }
+
+        // Scalar tail
+        let target = u32::from_ne_bytes(*b"\r\n\r\n");
+        while i + 3 < len {
+            if (ptr.add(i) as *const u32).read_unaligned() == target {
+                return Some(i + 4);
+            }
+            i += 1;
+        }
+
+        None
     }
-    None
 }
 
 /// Count the number of complete HTTP requests (\r\n\r\n boundaries) in a buffer.
+///
+/// SSE2: scans 16 byte positions per iteration using parallel comparison.
 #[inline]
 pub fn count_request_boundaries(buf: &[u8]) -> usize {
     if buf.len() < 4 {
         return 0;
     }
-    let target = u32::from_ne_bytes(*b"\r\n\r\n");
-    let ptr = buf.as_ptr();
-    let mut count = 0;
-    let mut i = 0;
-    while i <= buf.len() - 4 {
-        let word = unsafe { (ptr.add(i) as *const u32).read_unaligned() };
-        if word == target {
-            count += 1;
-            i += 4;
-        } else {
-            i += 1;
+
+    unsafe {
+        let ptr = buf.as_ptr();
+        let len = buf.len();
+        let cr = _mm_set1_epi8(b'\r' as i8);
+        let lf = _mm_set1_epi8(b'\n' as i8);
+        let mut count = 0;
+        let mut i = 0;
+
+        // SSE2: check 16 positions per iteration
+        while i + 19 <= len {
+            let v0 = _mm_loadu_si128(ptr.add(i) as *const __m128i);
+            let v1 = _mm_loadu_si128(ptr.add(i + 1) as *const __m128i);
+            let v2 = _mm_loadu_si128(ptr.add(i + 2) as *const __m128i);
+            let v3 = _mm_loadu_si128(ptr.add(i + 3) as *const __m128i);
+
+            let m = _mm_and_si128(
+                _mm_and_si128(_mm_cmpeq_epi8(v0, cr), _mm_cmpeq_epi8(v1, lf)),
+                _mm_and_si128(_mm_cmpeq_epi8(v2, cr), _mm_cmpeq_epi8(v3, lf)),
+            );
+            let mask = _mm_movemask_epi8(m) as u32;
+            count += mask.count_ones() as usize;
+            i += 16;
         }
+
+        // Scalar tail
+        let target = u32::from_ne_bytes(*b"\r\n\r\n");
+        while i + 3 < len {
+            if (ptr.add(i) as *const u32).read_unaligned() == target {
+                count += 1;
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+
+        count
     }
-    count
 }
 
 /// A parsed HTTP request (Tier 2).
