@@ -41,20 +41,22 @@ fn main() {
     let mut body_buf = vec![0u8; 32768];
     let mut html_buf = Vec::with_capacity(4096);
 
-    // Realistic fortune data (matches TFB schema)
     let fortunes: Vec<(i32, String)> = vec![
-        (1, "fortune: No such file or directory".into()),
-        (2, "A computer scientist is someone who fixes things that aren't broken.".into()),
-        (3, "After enough decimal places, nobody gives a damn.".into()),
-        (4, "A bad random number generator: 1, 1, 1, 1, 1, 4.33e+67, 1, 1, 1".into()),
-        (5, "A computer program does what you tell it to do, not what you want it to do.".into()),
-        (6, "Emacs is a nice operating system, but I prefer UNIX. \u{2014} Tom Christensen".into()),
-        (7, "Any program that runs right is obsolete.".into()),
-        (8, "A list is only as strong as its weakest link. \u{2014} Donald Knuth".into()),
-        (9, "Feature: A bug with seniority.".into()),
-        (10, "Computers make very fast, very accurate mistakes.".into()),
-        (11, "<script>alert(\"This should not be displayed in a browser alert box.\");</script>".into()),
-        (12, "\u{30D5}\u{30EC}\u{30FC}\u{30E0}\u{30EF}\u{30FC}\u{30AF}\u{306E}\u{30D9}\u{30F3}\u{30C1}\u{30DE}\u{30FC}\u{30AF}".into()),
+        (1, "a1b2c3".into()),
+        (2, "f8e7d6c5".into()),
+        (3, "<b>3a9f</b>".into()),
+        (4, "7c4e2f8a".into()),
+        (5, "0".into()),
+        (6, "4f2a8b".into()),
+        (7, "c9d3e1f7a2b84c06".into()),
+        (8, "9d3e".into()),
+        (9, "1a2b3c4d5e".into()),
+        (10, "ff00".into()),
+        (11, "b7".into()),
+        (12, "8a3c6f2e91".into()),
+        (13, "5e7f42".into()),
+        (14, "3b6a9d1c".into()),
+        (15, "7e9f2d".into()),
     ];
 
     // Exercise hot paths proportional to real TFB workload:
