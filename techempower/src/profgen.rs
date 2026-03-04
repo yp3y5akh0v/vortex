@@ -127,7 +127,23 @@ fn main() {
 
         // Fortunes template rendering (/fortunes endpoint)
         if i % 50 == 0 {
+            // Exercise both paths for PGO coverage
             vortex_template::render_fortunes(&fortunes, &mut html_buf);
+            black_box(DynHtmlResponse::write(
+                &mut send_buf,
+                &date,
+                &html_buf,
+            ));
+            // Zero-copy path (primary hot path in production)
+            let zc_fortunes: [(i32, &[u8]); 16] = [
+                (1, b"a1b2c3"), (2, b"f8e7d6c5"), (3, b"<b>3a9f</b>"),
+                (4, b"7c4e2f8a"), (5, b"0"), (6, b"4f2a8b"),
+                (7, b"c9d3e1f7a2b84c06"), (8, b"9d3e"), (9, b"1a2b3c4d5e"),
+                (10, b"ff00"), (11, b"b7"), (12, b"8a3c6f2e91"),
+                (13, b"5e7f42"), (14, b"3b6a9d1c"), (15, b"7e9f2d"),
+                (0, b""),
+            ];
+            vortex_template::render_fortunes_zerocopy(&zc_fortunes, 15, &mut html_buf);
             black_box(DynHtmlResponse::write(
                 &mut send_buf,
                 &date,

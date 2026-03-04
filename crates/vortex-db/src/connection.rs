@@ -102,6 +102,53 @@ impl PgConnection {
         Err(last_err)
     }
 
+    /// Connect to PostgreSQL with custom prepared statements.
+    /// Retries up to 10 times with exponential backoff.
+    pub fn connect_resolved_with_stmts(
+        addr: std::net::SocketAddr,
+        config: &DbConfig,
+        stmts: &[(&str, &str, &[u32])],
+    ) -> io::Result<Self> {
+        let mut last_err = io::Error::new(io::ErrorKind::TimedOut, "failed to connect");
+
+        for attempt in 0..10 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(50 * (1 << attempt.min(5))));
+            }
+
+            let stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
+                Ok(s) => s,
+                Err(e) => { last_err = e; continue; }
+            };
+
+            if let Err(e) = stream.set_nodelay(true) { last_err = e; continue; }
+            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+
+            let mut conn = Self {
+                reader: BufReader::with_capacity(8192, stream),
+                wbuf: Vec::with_capacity(32768),
+                rbuf: Vec::with_capacity(4096),
+            };
+
+            match conn.startup(config) {
+                Ok(()) => {}
+                Err(e) => { last_err = e; continue; }
+            }
+
+            match conn.prepare_dynamic(stmts) {
+                Ok(()) => {}
+                Err(e) => { last_err = e; continue; }
+            }
+
+            conn.reader.get_mut().set_read_timeout(None)?;
+            conn.reader.get_mut().set_write_timeout(None)?;
+            return Ok(conn);
+        }
+
+        Err(last_err)
+    }
+
     /// Consume this connection and return the raw socket fd.
     ///
     /// The fd is in blocking mode; the caller should set `O_NONBLOCK` if needed.
@@ -184,6 +231,16 @@ impl PgConnection {
             "UPDATE world SET randomNumber = w.r FROM (SELECT unnest($1::int[]) AS i, unnest($2::int[]) AS r) AS w WHERE world.id = w.i",
             &[OID_INT4_ARRAY, OID_INT4_ARRAY],
         )?;
+        wire::write_sync(self.reader.get_mut())?;
+        wire::drain_until_ready(&mut self.reader)?;
+        Ok(())
+    }
+
+    /// Prepare statements from a dynamic list: (name, sql, param_oids).
+    pub fn prepare_dynamic(&mut self, stmts: &[(&str, &str, &[u32])]) -> io::Result<()> {
+        for &(name, sql, oids) in stmts {
+            wire::write_parse(self.reader.get_mut(), name, sql, oids)?;
+        }
         wire::write_sync(self.reader.get_mut())?;
         wire::drain_until_ready(&mut self.reader)?;
         Ok(())

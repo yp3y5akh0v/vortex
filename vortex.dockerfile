@@ -10,7 +10,6 @@ RUN apt-get update && apt-get install -y \
     && ln -s /usr/lib/llvm-16/lib/libbolt_rt_hugify.a /usr/lib/libbolt_rt_hugify.a \
     && rm -rf /var/lib/apt/lists/*
 
-# llvm-tools for PGO profile merging
 RUN rustup component add llvm-tools-preview
 
 WORKDIR /vortex

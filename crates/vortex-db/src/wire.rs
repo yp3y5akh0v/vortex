@@ -415,7 +415,15 @@ pub fn drain_until_ready_buf(reader: &mut impl Read, rbuf: &mut Vec<u8>) -> io::
 /// Returns `Some(bytes_consumed)` when found, `None` if incomplete.
 #[inline]
 pub fn try_find_ready(buf: &[u8]) -> Option<usize> {
-    let mut pos = 0;
+    try_find_ready_from(buf, 0)
+}
+
+/// Scan for ReadyForQuery starting from `start_pos`.
+/// Returns `Some(bytes_consumed_total)` when found, `None` if incomplete.
+/// Use with a tracked scan position to avoid re-scanning already-parsed messages.
+#[inline]
+pub fn try_find_ready_from(buf: &[u8], start_pos: usize) -> Option<usize> {
+    let mut pos = start_pos;
     while pos + 5 <= buf.len() {
         let msg_type = buf[pos];
         let len = i32::from_be_bytes([buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4]]) as usize;
@@ -497,6 +505,33 @@ pub fn parse_fortune_rows_buf(buf: &[u8], out: &mut Vec<(i32, String)>) {
         }
         pos = msg_end;
     }
+}
+
+/// Parse fortune rows as zero-copy byte slices referencing the input buffer.
+/// Fills a fixed-size stack array — no heap allocations.
+/// Returns the number of rows parsed.
+#[inline]
+pub fn parse_fortune_rows_zerocopy<'a>(buf: &'a [u8], out: &mut [(i32, &'a [u8]); 16]) -> usize {
+    let mut pos = 0;
+    let mut count = 0;
+    while pos + 5 <= buf.len() {
+        let msg_type = buf[pos];
+        let len = i32::from_be_bytes([buf[pos + 1], buf[pos + 2], buf[pos + 3], buf[pos + 4]]) as usize;
+        let msg_end = pos + 1 + len;
+        match msg_type {
+            b'D' if count < 16 => {
+                let b = pos + 5;
+                let id = i32::from_be_bytes([buf[b + 6], buf[b + 7], buf[b + 8], buf[b + 9]]);
+                let text_len = i32::from_be_bytes([buf[b + 10], buf[b + 11], buf[b + 12], buf[b + 13]]) as usize;
+                out[count] = (id, &buf[b + 14..b + 14 + text_len]);
+                count += 1;
+            }
+            b'Z' => return count,
+            _ => {}
+        }
+        pos = msg_end;
+    }
+    count
 }
 
 // ── Minimal MD5 implementation ───────────────────────────────────────

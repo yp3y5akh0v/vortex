@@ -8,39 +8,40 @@ use vortex_io::uring::bufring::ProvidedBufRing;
 use vortex_io::uring::filetable::FileTable;
 use vortex_io::uring::ring::{Ring, RingConfig};
 use vortex_http::date::DateCache;
-use vortex_http::parser::{self, Route};
-use vortex_http::pipeline;
-use vortex_http::response::{DynHtmlResponse, DynJsonResponse};
 use vortex_db::{DbConfig, PgConnection};
+use crate::app::{App, RouteAction};
 use std::collections::VecDeque;
 use std::io;
+use std::marker::PhantomData;
 
 /// Vortex HTTP server.
-pub struct Server;
+pub struct Server<A: App>(PhantomData<A>);
 
-impl Server {
+impl<A: App> Server<A> {
     /// Create a new server builder.
-    pub fn builder() -> ServerBuilder {
+    pub fn builder() -> ServerBuilder<A> {
         ServerBuilder {
             addr: "0.0.0.0".to_string(),
             port: 8080,
             workers: 0,
             backlog: 4096,
             sqpoll: false,
+            _app: PhantomData,
         }
     }
 }
 
 /// Builder for configuring and launching the server.
-pub struct ServerBuilder {
+pub struct ServerBuilder<A: App> {
     addr: String,
     port: u16,
     workers: usize,
     backlog: i32,
     sqpoll: bool,
+    _app: PhantomData<A>,
 }
 
-impl ServerBuilder {
+impl<A: App> ServerBuilder<A> {
     pub fn addr(mut self, addr: &str) -> Self {
         self.addr = addr.to_string();
         self
@@ -86,7 +87,7 @@ impl ServerBuilder {
 
         // Database config (read once, shared by reference)
         let db_config = DbConfig::from_env();
-        let db_conns: usize = std::env::var("DB_POOL_SIZE")
+        let db_pool_size: usize = std::env::var("DB_POOL_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(7);
@@ -102,6 +103,9 @@ impl ServerBuilder {
                 None
             }
         };
+
+        // Collect statements once (they're the same for all workers)
+        let stmts = A::db_statements();
 
         eprintln!(
             "[vortex] Starting {} workers on {}:{} (sqpoll={})",
@@ -122,11 +126,13 @@ impl ServerBuilder {
                 database: db_config.database.clone(),
             };
             let db_resolved = db_addr;
+            let stmts = stmts.clone();
+            let db_pool = db_pool_size;
 
             let handle = std::thread::Builder::new()
                 .name(format!("vortex-w{}", core_id))
                 .spawn(move || {
-                    worker_main(core_id, num_workers, &addr, port, backlog, sqpoll, &db_cfg, db_conns, db_resolved)
+                    worker_main::<A>(core_id, num_workers, &addr, port, backlog, sqpoll, &db_cfg, db_pool, db_resolved, &stmts)
                 })?;
             handles.push(handle);
         }
@@ -163,39 +169,25 @@ const DB_BUF_SIZE: usize = 32768;
 
 // ── Async DB types ──────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
-enum DbOp {
-    Db,
-    Queries,
-    Fortunes,
-    UpdatesWrite,
-}
-
-struct AsyncDbConn {
+struct AsyncDbConn<S> {
     slot: u32,
     wbuf: Vec<u8>,
     rbuf: Vec<u8>,
     rpos: usize,
     idle: bool,
     http_slot: u32,
-    op: DbOp,
-    queries: i32,
-    worlds: Vec<(i32, i32)>,
-    ids: Vec<i32>,
-    random_numbers: Vec<i32>,
-    fortunes: Vec<(i32, String)>,
-    html: Vec<u8>,
+    state: S,
 }
 
 struct DbRequest {
     http_slot: u32,
-    route: Route,
+    route_id: u8,
     queries: i32,
 }
 
 // ── Worker main ─────────────────────────────────────────────────────
 
-fn worker_main(
+fn worker_main<A: App>(
     core_id: usize,
     num_workers: usize,
     addr: &str,
@@ -205,6 +197,7 @@ fn worker_main(
     db_config: &DbConfig,
     db_pool_size: usize,
     db_addr: Option<std::net::SocketAddr>,
+    stmts: &[(&str, &str, &[u32])],
 ) -> io::Result<()> {
     let _ = affinity::pin_to_core(core_id);
 
@@ -235,14 +228,14 @@ fn worker_main(
     }
     let mut date = DateCache::new();
 
-    // ── Async DB connections ────────────────────────────────────────
-    let mut db_conns: Vec<AsyncDbConn> = Vec::with_capacity(db_pool_size);
+    // ── Async DB connection pool ────────────────────────────────────
+    let mut db_conns: Vec<AsyncDbConn<A::DbState>> = Vec::with_capacity(db_pool_size);
     let mut db_queue: VecDeque<DbRequest> = VecDeque::with_capacity(256);
 
     if let Some(resolved) = db_addr {
         std::thread::sleep(std::time::Duration::from_millis(core_id as u64 * 10));
         for _ in 0..db_pool_size {
-            match PgConnection::connect_resolved(resolved, db_config) {
+            match PgConnection::connect_resolved_with_stmts(resolved, db_config, stmts) {
                 Ok(pg_conn) => {
                     let raw_fd = pg_conn.into_raw_fd();
                     unsafe {
@@ -259,7 +252,6 @@ fn worker_main(
                         break;
                     }
                     unsafe { libc::close(raw_fd); }
-
                     db_conns.push(AsyncDbConn {
                         slot,
                         wbuf: Vec::with_capacity(DB_BUF_SIZE),
@@ -267,23 +259,17 @@ fn worker_main(
                         rpos: 0,
                         idle: true,
                         http_slot: 0,
-                        op: DbOp::Db,
-                        queries: 0,
-                        worlds: Vec::with_capacity(500),
-                        ids: Vec::with_capacity(500),
-                        random_numbers: Vec::with_capacity(500),
-                        fortunes: Vec::with_capacity(16),
-                        html: Vec::with_capacity(4096),
+                        state: A::DbState::default(),
                     });
                 }
                 Err(e) => {
-                    eprintln!("[vortex] Worker {} DB connect failed: {}", core_id, e);
+                    eprintln!("[vortex] Worker {} DB connect failed: {} (DB endpoints disabled)", core_id, e);
                     break;
                 }
             }
         }
         if !db_conns.is_empty() {
-            eprintln!("[vortex] Worker {} connected to DB ({} async connections)", core_id, db_conns.len());
+            eprintln!("[vortex] Worker {} connected to DB ({} connections)", core_id, db_conns.len());
         } else {
             eprintln!("[vortex] Worker {} DB not available (DB endpoints disabled)", core_id);
         }
@@ -371,14 +357,12 @@ fn worker_main(
                     let len = result as usize;
                     let buf_id = multishot::buffer_id(flags).unwrap();
                     let recv_data = buf_ring.get_buf(buf_id, len);
-                    let route = parser::classify_fast(recv_data);
+                    let action = A::classify(recv_data);
 
-                    match route {
-                        Route::Plaintext | Route::Json | Route::NotFound => {
+                    match action {
+                        RouteAction::Fast(id) => {
                             let resp_len = if let Some(conn) = &mut connections[si] {
-                                let (_count, rlen) = pipeline::process_pipelined(
-                                    recv_data, &mut conn.send_buf, &date,
-                                );
+                                let (_count, rlen) = A::handle_fast(id, recv_data, &mut conn.send_buf, &date);
                                 rlen
                             } else { 0 };
                             buf_ring.return_buf(buf_id);
@@ -398,12 +382,7 @@ fn worker_main(
                             }
                         }
 
-                        Route::Db | Route::Queries | Route::Fortunes | Route::Updates => {
-                            let queries = match route {
-                                Route::Queries | Route::Updates =>
-                                    vortex_db::clamp_queries(parser::parse_queries_param(recv_data)),
-                                _ => 1,
-                            };
+                        RouteAction::Db { id, queries } => {
                             buf_ring.return_buf(buf_id);
 
                             if db_conns.is_empty() {
@@ -411,15 +390,16 @@ fn worker_main(
                                 if resp_len > 0 {
                                     submit_http_send(slot, &connections, si, resp_len, &mut ring);
                                 }
-                                continue;
-                            }
-
-                            let db_idx = db_conns.iter().position(|c| c.idle);
-                            if let Some(db_idx) = db_idx {
-                                start_db_op(&mut db_conns[db_idx], db_idx, slot, route, queries, &mut ring);
+                            } else if let Some(db_idx) = db_conns.iter().position(|c| c.idle) {
+                                start_db_op::<A>(&mut db_conns[db_idx], db_idx, slot, id, queries, &mut ring);
                             } else {
-                                db_queue.push_back(DbRequest { http_slot: slot, route, queries });
+                                db_queue.push_back(DbRequest { http_slot: slot, route_id: id, queries });
                             }
+                        }
+
+                        RouteAction::NotFound => {
+                            buf_ring.return_buf(buf_id);
+                            close_connection(&mut connections, si, slot, &mut ring, &mut send_buf_pool)?;
                         }
                     }
                 }
@@ -458,7 +438,7 @@ fn worker_main(
                         db.idle = true;
                         let resp_len = write_500(&mut connections, hs as usize);
                         if resp_len > 0 { submit_http_send(hs, &connections, hs as usize, resp_len, &mut ring); }
-                        drain_db_queue(&mut db_queue, &mut db_conns, &connections, &mut ring);
+                        drain_db_queue::<A>(&mut db_queue, &mut db_conns, &connections, &mut ring);
                         continue;
                     }
 
@@ -477,24 +457,22 @@ fn worker_main(
                 // ── DB recv complete ────────────────────────────────
                 5 => {
                     let db_idx = (user_data & 0xFFFFFFFF) as usize;
+                    let db = &mut db_conns[db_idx];
 
                     if result <= 0 {
-                        let db = &mut db_conns[db_idx];
                         let hs = db.http_slot;
                         db.idle = true;
                         let resp_len = write_500(&mut connections, hs as usize);
                         if resp_len > 0 { submit_http_send(hs, &connections, hs as usize, resp_len, &mut ring); }
-                        drain_db_queue(&mut db_queue, &mut db_conns, &connections, &mut ring);
+                        drain_db_queue::<A>(&mut db_queue, &mut db_conns, &connections, &mut ring);
                         continue;
                     }
 
-                    db_conns[db_idx].rpos += result as usize;
+                    db.rpos += result as usize;
 
                     // Check if complete PG response (ReadyForQuery found)
-                    let rpos = db_conns[db_idx].rpos;
-                    if vortex_db::wire::try_find_ready(&db_conns[db_idx].rbuf[..rpos]).is_none() {
-                        // Need more data
-                        let db = &mut db_conns[db_idx];
+                    let rpos = db.rpos;
+                    if vortex_db::wire::try_find_ready(&db.rbuf[..rpos]).is_none() {
                         unsafe {
                             let sqe = multishot::prep_recv_fixed(
                                 db.slot,
@@ -507,66 +485,19 @@ fn worker_main(
                         continue;
                     }
 
-                    // ── Complete PG response — process by operation type ──
-                    let db = &mut db_conns[db_idx];
+                    // ── Complete PG response — delegate to App ──
                     let hs = db.http_slot;
                     let hi = hs as usize;
-                    let op = db.op;
 
-                    match op {
-                        DbOp::Db => {
-                            let resp_len = match vortex_db::wire::parse_single_world_buf(&db.rbuf[..db.rpos]) {
-                                Some((id, rn)) => {
-                                    let body_len = vortex_json::write_world(&mut body_buf, id, rn);
-                                    if let Some(conn) = &mut connections[hi] {
-                                        DynJsonResponse::write(&mut conn.send_buf, &date, &body_buf[..body_len])
-                                    } else { 0 }
-                                }
-                                None => write_500(&mut connections, hi),
-                            };
-                            db.idle = true;
-                            if resp_len > 0 { submit_http_send(hs, &connections, hi, resp_len, &mut ring); }
-                        }
+                    let resp_len = if let Some(conn) = &mut connections[hi] {
+                        A::db_finish(&mut db.state, &db.rbuf, db.rpos, &mut conn.send_buf, &date, &mut body_buf)
+                    } else { 0 };
 
-                        DbOp::Queries => {
-                            db.worlds.clear();
-                            vortex_db::wire::parse_world_rows_buf(&db.rbuf[..db.rpos], &mut db.worlds);
-                            let body_len = vortex_json::write_worlds(&mut body_buf, &db.worlds);
-                            let resp_len = if let Some(conn) = &mut connections[hi] {
-                                DynJsonResponse::write(&mut conn.send_buf, &date, &body_buf[..body_len])
-                            } else { 0 };
-                            db.idle = true;
-                            if resp_len > 0 { submit_http_send(hs, &connections, hi, resp_len, &mut ring); }
-                        }
-
-                        DbOp::Fortunes => {
-                            db.fortunes.clear();
-                            vortex_db::wire::parse_fortune_rows_buf(&db.rbuf[..db.rpos], &mut db.fortunes);
-                            vortex_template::render_fortunes(&db.fortunes, &mut db.html);
-                            let resp_len = if let Some(conn) = &mut connections[hi] {
-                                DynHtmlResponse::write(&mut conn.send_buf, &date, &db.html)
-                            } else { 0 };
-                            db.idle = true;
-                            if resp_len > 0 { submit_http_send(hs, &connections, hi, resp_len, &mut ring); }
-                        }
-
-                        DbOp::UpdatesWrite => {
-                            // Phase 2 done: build JSON response
-                            db.worlds.clear();
-                            for i in 0..db.ids.len() {
-                                db.worlds.push((db.ids[i], db.random_numbers[i]));
-                            }
-                            let body_len = vortex_json::write_worlds(&mut body_buf, &db.worlds);
-                            let resp_len = if let Some(conn) = &mut connections[hi] {
-                                DynJsonResponse::write(&mut conn.send_buf, &date, &body_buf[..body_len])
-                            } else { 0 };
-                            db.idle = true;
-                            if resp_len > 0 { submit_http_send(hs, &connections, hi, resp_len, &mut ring); }
-                        }
-                    }
+                    db.idle = true;
+                    if resp_len > 0 { submit_http_send(hs, &connections, hi, resp_len, &mut ring); }
 
                     // DB conn became idle — drain queued requests
-                    drain_db_queue(&mut db_queue, &mut db_conns, &connections, &mut ring);
+                    drain_db_queue::<A>(&mut db_queue, &mut db_conns, &connections, &mut ring);
                 }
 
                 _ => {}
@@ -598,70 +529,20 @@ fn submit_http_send(
 }
 
 /// Build PG wire protocol messages and submit send to DB socket.
-fn start_db_op(
-    db: &mut AsyncDbConn,
+fn start_db_op<A: App>(
+    db: &mut AsyncDbConn<A::DbState>,
     db_idx: usize,
     http_slot: u32,
-    route: Route,
+    route_id: u8,
     queries: i32,
     ring: &mut Ring,
 ) {
     db.idle = false;
     db.http_slot = http_slot;
-    db.queries = queries;
     db.rpos = 0;
     db.wbuf.clear();
 
-    match route {
-        Route::Db => {
-            db.op = DbOp::Db;
-            let id = vortex_db::random_world_id();
-            vortex_db::wire::buf_bind_i32(&mut db.wbuf, "w", &[id]);
-            vortex_db::wire::buf_execute(&mut db.wbuf);
-            vortex_db::wire::buf_sync(&mut db.wbuf);
-        }
-        Route::Queries => {
-            db.op = DbOp::Queries;
-            db.ids.clear();
-            for _ in 0..queries {
-                db.ids.push(vortex_db::random_world_id());
-            }
-            for i in 0..db.ids.len() {
-                let id = db.ids[i];
-                vortex_db::wire::buf_bind_i32(&mut db.wbuf, "w", &[id]);
-                vortex_db::wire::buf_execute(&mut db.wbuf);
-            }
-            vortex_db::wire::buf_sync(&mut db.wbuf);
-        }
-        Route::Fortunes => {
-            db.op = DbOp::Fortunes;
-            vortex_db::wire::buf_bind_no_params(&mut db.wbuf, "f", &[1, 0]);
-            vortex_db::wire::buf_execute(&mut db.wbuf);
-            vortex_db::wire::buf_sync(&mut db.wbuf);
-        }
-        Route::Updates => {
-            db.op = DbOp::UpdatesWrite;
-            db.ids.clear();
-            db.random_numbers.clear();
-            for _ in 0..queries {
-                db.ids.push(vortex_db::random_world_id());
-            }
-            db.ids.sort_unstable();
-            for _ in 0..queries {
-                db.random_numbers.push(vortex_db::random_world_id());
-            }
-            // SELECTs + batch UPDATE in single pipeline (one round-trip)
-            for i in 0..db.ids.len() {
-                let id = db.ids[i];
-                vortex_db::wire::buf_bind_i32(&mut db.wbuf, "w", &[id]);
-                vortex_db::wire::buf_execute(&mut db.wbuf);
-            }
-            vortex_db::wire::buf_bind_i32_arrays(&mut db.wbuf, "ub", &db.ids, &db.random_numbers);
-            vortex_db::wire::buf_execute(&mut db.wbuf);
-            vortex_db::wire::buf_sync(&mut db.wbuf);
-        }
-        _ => {}
-    }
+    A::db_start(route_id, queries, &mut db.wbuf, &mut db.state);
 
     unsafe {
         let sqe = multishot::prep_send_fixed(
@@ -672,32 +553,20 @@ fn start_db_op(
     }
 }
 
-/// Process queued DB requests when a connection becomes idle.
-fn drain_db_queue(
+/// Process queued DB requests when any connection becomes idle.
+fn drain_db_queue<A: App>(
     queue: &mut VecDeque<DbRequest>,
-    db_conns: &mut [AsyncDbConn],
+    db_conns: &mut [AsyncDbConn<A::DbState>],
     connections: &[Option<Connection>],
     ring: &mut Ring,
 ) {
-    'drain: while !queue.is_empty() {
-        let idle_idx = match db_conns.iter().position(|c| c.idle) {
-            Some(idx) => idx,
-            None => break,
-        };
-
-        let req = loop {
-            match queue.pop_front() {
-                Some(req) if connections[req.http_slot as usize].is_some() => break Some(req),
-                Some(_) => {} // HTTP connection gone, skip
-                None => break None,
+    while let Some(db_idx) = db_conns.iter().position(|c| c.idle) {
+        match queue.pop_front() {
+            Some(req) if connections[req.http_slot as usize].is_some() => {
+                start_db_op::<A>(&mut db_conns[db_idx], db_idx, req.http_slot, req.route_id, req.queries, ring);
             }
-        };
-
-        match req {
-            Some(req) => {
-                start_db_op(&mut db_conns[idle_idx], idle_idx, req.http_slot, req.route, req.queries, ring);
-            }
-            None => break 'drain,
+            Some(_) => continue, // HTTP connection gone, try next
+            None => return,
         }
     }
 }

@@ -42,12 +42,13 @@ services:
     environment:
       - VORTEX_WORKERS=${VORTEX_WORKERS:-0}
       - VORTEX_SQPOLL=${VORTEX_SQPOLL:-0}
+      - DB_POOL_SIZE=${DB_POOL_SIZE:-7}
       - DB_HOST=postgres
       - DB_PORT=5432
       - DB_USER=benchmarkdbuser
       - DB_PASS=benchmarkdbpass
       - DB_NAME=hello_world
-      - DB_POOL_SIZE=${DB_POOL_SIZE:-7}
+
     ulimits:
       memlock:
         soft: -1
