@@ -1,22 +1,32 @@
 # Vortex
 
-High-performance HTTP server built for TechEmpower benchmarks.
+A high-performance HTTP framework for Linux, built on io_uring.
 
-## Architecture
+## Features
 
-- **I/O**: io_uring with multishot accept, DEFER_TASKRUN, cascading kernel fallbacks
-- **Threading**: Thread-per-core with CPU pinning (no work-stealing)
-- **HTTP**: Tiered parser — single-byte route classification for benchmark paths
-- **JSON**: Hand-optimized direct-to-buffer serialization (no serde)
-- **Database**: Custom PostgreSQL binary wire protocol with prepared statements and pipelined queries
-- **Memory**: mimalloc global allocator, pre-allocated per-worker buffers, BufReader on DB connections
-- **Compilation**: fat LTO, codegen-units=1, target-cpu=native, panic=abort
+- **io_uring** with multishot accept, provided buffer rings, registered files, and cascading kernel fallbacks
+- **Thread-per-core** architecture with CPU pinning — no work-stealing, no shared state
+- **Zero-allocation HTTP parser** with tiered fast-path classification
+- **Custom PostgreSQL client** using binary wire protocol, pipelined queries, and async I/O
+- **Hand-optimized JSON** serialization — direct-to-buffer with itoa, no serde
+- **PGO + BOLT** support for production builds
 
-## Test URLs
+## Quick Start
 
-- `/plaintext` - Plaintext response
-- `/json` - JSON serialization
-- `/db` - Single database query
-- `/queries?q=` - Multiple database queries
-- `/fortunes` - Fortunes HTML template
-- `/updates?q=` - Database updates
+```bash
+docker compose up
+```
+
+Starts the server on port 8080 with PostgreSQL.
+
+## Build Optimized Binary
+
+```bash
+docker build -f vortex.dockerfile -t vortex .
+```
+
+Produces a PGO + BOLT optimized binary for maximum throughput.
+
+## License
+
+MIT
