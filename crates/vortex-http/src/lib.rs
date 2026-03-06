@@ -7,4 +7,3 @@ pub mod parser;
 pub mod request;
 pub mod response;
 pub mod date;
-pub mod pipeline;

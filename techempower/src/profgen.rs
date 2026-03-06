@@ -11,13 +11,17 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::hint::black_box;
 use vortex_http::date::DateCache;
 use vortex_http::parser;
-use vortex_http::pipeline;
-use vortex_http::response::{DynHtmlResponse, DynJsonResponse};
+use vortex_http::response::{StaticResponse, DynJsonResponse, DynHtmlResponse};
+
+const PLAINTEXT_CT: &[u8] = b"text/plain";
+const PLAINTEXT_BODY: &[u8] = b"Benchmark profiling data";
+const JSON_CT: &[u8] = b"application/json";
+const JSON_BODY: &[u8] = b"{\"key\":\"profiling\"}";
 
 fn main() {
     let mut date = DateCache::new();
 
-    // Realistic HTTP requests matching TFB wrk format
+    // Realistic HTTP requests matching wrk format
     let plaintext_req =
         b"GET /plaintext HTTP/1.1\r\nHost: tfb-server:8080\r\nAccept: */*\r\n\r\n";
     let json_req =
@@ -31,7 +35,7 @@ fn main() {
     let db_req =
         b"GET /db HTTP/1.1\r\nHost: tfb-server:8080\r\nAccept: */*\r\n\r\n";
 
-    // 16x pipelined plaintext (TechEmpower methodology)
+    // 16x pipelined plaintext
     let mut pipelined = Vec::new();
     for _ in 0..16 {
         pipelined.extend_from_slice(plaintext_req);
@@ -59,15 +63,10 @@ fn main() {
         (15, "7e9f2d".into()),
     ];
 
-    // Exercise hot paths proportional to real TFB workload:
-    // - Plaintext pipelined: highest volume
-    // - JSON: high volume
-    // - DB/queries/updates JSON: medium volume
-    // - Fortunes HTML: lower volume
     for i in 0..500_000u32 {
         date.maybe_update();
 
-        // Route classification (runs on every recv)
+        // Route classification
         black_box(parser::classify_fast(plaintext_req));
         black_box(parser::classify_fast(json_req));
         black_box(parser::classify_fast(db_req));
@@ -83,19 +82,20 @@ fn main() {
         black_box(parser::find_request_end(plaintext_req));
         black_box(parser::count_request_boundaries(&pipelined));
 
-        // Pipelined response generation (primary plaintext hot path)
-        black_box(pipeline::process_pipelined(
-            &pipelined,
-            &mut send_buf,
-            &date,
-        ));
+        // Pipelined response generation
+        {
+            let count = parser::count_request_boundaries(&pipelined);
+            let resp_len = StaticResponse::write(&mut send_buf, &date, PLAINTEXT_CT, PLAINTEXT_BODY);
+            let mut offset = resp_len;
+            for _ in 1..count {
+                send_buf.copy_within(0..resp_len, offset);
+                offset += resp_len;
+            }
+            black_box(offset);
+        }
 
-        // Single JSON response
-        black_box(pipeline::process_pipelined(
-            json_req.as_slice(),
-            &mut send_buf,
-            &date,
-        ));
+        // Single static response
+        black_box(StaticResponse::write(&mut send_buf, &date, JSON_CT, JSON_BODY));
 
         // Dynamic JSON: single world (/db endpoint)
         let id = (i % 10000 + 1) as i32;
@@ -127,14 +127,12 @@ fn main() {
 
         // Fortunes template rendering (/fortunes endpoint)
         if i % 50 == 0 {
-            // Exercise both paths for PGO coverage
             vortex_template::render_fortunes(&fortunes, &mut html_buf);
             black_box(DynHtmlResponse::write(
                 &mut send_buf,
                 &date,
                 &html_buf,
             ));
-            // Zero-copy path (primary hot path in production)
             let zc_fortunes: [(i32, &[u8]); 16] = [
                 (1, b"a1b2c3"), (2, b"f8e7d6c5"), (3, b"<b>3a9f</b>"),
                 (4, b"7c4e2f8a"), (5, b"0"), (6, b"4f2a8b"),

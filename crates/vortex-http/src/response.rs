@@ -5,50 +5,47 @@
 
 use crate::date::DateCache;
 
-/// Plaintext response.
-pub struct PlaintextResponse;
+/// Static response with fixed content-type and body.
+/// Used for endpoints that always return the same content.
+pub struct StaticResponse;
 
-impl PlaintextResponse {
-    const HEADER: &'static [u8] = b"HTTP/1.1 200 OK\r\nServer: V\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n";
-    const BODY: &'static [u8] = b"Hello, World!";
+impl StaticResponse {
+    const STATUS_LINE: &'static [u8] = b"HTTP/1.1 200 OK\r\nServer: V\r\nContent-Type: ";
+    const CL_PREFIX: &'static [u8] = b"\r\nContent-Length: ";
 
-    /// Assemble the complete plaintext response per-request.
+    /// Write a complete static HTTP response.
+    /// `content_type` e.g. b"text/plain", `body` e.g. b"Hello, World!"
     #[inline]
-    pub fn write(buf: &mut [u8], date: &DateCache) -> usize {
+    pub fn write(buf: &mut [u8], date: &DateCache, content_type: &[u8], body: &[u8]) -> usize {
         let mut off = 0;
-        buf[off..off + Self::HEADER.len()].copy_from_slice(Self::HEADER);
-        off += Self::HEADER.len();
+
+        buf[off..off + Self::STATUS_LINE.len()].copy_from_slice(Self::STATUS_LINE);
+        off += Self::STATUS_LINE.len();
+
+        buf[off..off + content_type.len()].copy_from_slice(content_type);
+        off += content_type.len();
+
+        buf[off..off + Self::CL_PREFIX.len()].copy_from_slice(Self::CL_PREFIX);
+        off += Self::CL_PREFIX.len();
+
+        let mut itoa_buf = itoa::Buffer::new();
+        let cl_val = itoa_buf.format(body.len());
+        buf[off..off + cl_val.len()].copy_from_slice(cl_val.as_bytes());
+        off += cl_val.len();
+
+        buf[off..off + 2].copy_from_slice(b"\r\n");
+        off += 2;
+
         let date_bytes = date.header_bytes();
         buf[off..off + date_bytes.len()].copy_from_slice(date_bytes);
         off += date_bytes.len();
+
         buf[off..off + 2].copy_from_slice(b"\r\n");
         off += 2;
-        buf[off..off + Self::BODY.len()].copy_from_slice(Self::BODY);
-        off += Self::BODY.len();
-        off
-    }
-}
 
-/// JSON response.
-pub struct JsonResponse;
+        buf[off..off + body.len()].copy_from_slice(body);
+        off += body.len();
 
-impl JsonResponse {
-    const HEADER: &'static [u8] = b"HTTP/1.1 200 OK\r\nServer: V\r\nContent-Type: application/json\r\nContent-Length: 27\r\n";
-    const BODY: &'static [u8] = b"{\"message\":\"Hello, World!\"}";
-
-    /// Assemble the complete JSON response per-request.
-    #[inline]
-    pub fn write(buf: &mut [u8], date: &DateCache) -> usize {
-        let mut off = 0;
-        buf[off..off + Self::HEADER.len()].copy_from_slice(Self::HEADER);
-        off += Self::HEADER.len();
-        let date_bytes = date.header_bytes();
-        buf[off..off + date_bytes.len()].copy_from_slice(date_bytes);
-        off += date_bytes.len();
-        buf[off..off + 2].copy_from_slice(b"\r\n");
-        off += 2;
-        buf[off..off + Self::BODY.len()].copy_from_slice(Self::BODY);
-        off += Self::BODY.len();
         off
     }
 }
