@@ -15,8 +15,7 @@ use vortex_http::response::{StaticResponse, DynJsonResponse, DynHtmlResponse};
 
 const PLAINTEXT_CT: &[u8] = b"text/plain";
 const PLAINTEXT_BODY: &[u8] = b"Benchmark profiling data";
-const JSON_CT: &[u8] = b"application/json";
-const JSON_BODY: &[u8] = b"{\"key\":\"profiling\"}";
+const JSON_MESSAGE: &str = "profiling data";
 
 fn main() {
     let mut date = DateCache::new();
@@ -94,8 +93,11 @@ fn main() {
             black_box(offset);
         }
 
-        // Single static response
-        black_box(StaticResponse::write(&mut send_buf, &date, JSON_CT, JSON_BODY));
+        // JSON message serialization
+        {
+            let blen = vortex_json::write_message(&mut body_buf, JSON_MESSAGE);
+            black_box(DynJsonResponse::write(&mut send_buf, &date, &body_buf[..blen]));
+        }
 
         // Dynamic JSON: single world (/db endpoint)
         let id = (i % 10000 + 1) as i32;

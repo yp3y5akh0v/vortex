@@ -43,6 +43,24 @@ pub fn write_worlds(buf: &mut [u8], worlds: &[(i32, i32)]) -> usize {
     offset + 1
 }
 
+/// Write a JSON message object: {"message":"<msg>"}
+///
+/// Returns bytes written.
+#[inline]
+pub fn write_message(buf: &mut [u8], message: &str) -> usize {
+    let mut offset = 0;
+
+    buf[offset..offset + 12].copy_from_slice(b"{\"message\":\"");
+    offset += 12;
+
+    let msg = message.as_bytes();
+    buf[offset..offset + msg.len()].copy_from_slice(msg);
+    offset += msg.len();
+
+    buf[offset..offset + 2].copy_from_slice(b"\"}");
+    offset + 2
+}
+
 /// Write an i32 as decimal ASCII. Returns bytes written.
 #[inline]
 fn write_i32(buf: &mut [u8], val: i32) -> usize {
